@@ -754,44 +754,201 @@ def statistical_forecast_pb(
     return base
 
 
+def _minmax_scale(values: np.ndarray) -> np.ndarray:
+    if len(values) == 0:
+        return values
+    vmin = np.nanmin(values)
+    vmax = np.nanmax(values)
+    if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+        return np.zeros(len(values))
+    return (values - vmin) / (vmax - vmin)
+
+
+def _build_sim_count_df(counter: Counter, key_name: str) -> pd.DataFrame:
+    if not counter:
+        return pd.DataFrame(columns=[key_name, "sim_count", "sim_rate"])
+    rows = [(k, v) for k, v in counter.items()]
+    df = pd.DataFrame(rows, columns=[key_name, "sim_count"]).sort_values("sim_count", ascending=False)
+    total = df["sim_count"].sum()
+    df["sim_rate"] = np.where(total > 0, df["sim_count"] / total, 0.0)
+    return df.reset_index(drop=True)
+
+
+def run_ticket_simulation_bundle(
+    white_forecast: pd.DataFrame,
+    pb_forecast: pd.DataFrame,
+    n_samples: int = 8000,
+    top_n: int = 12,
+    seed: int = 42,
+    overlap_lambda: float = 0.35,
+) -> dict[str, pd.DataFrame]:
+    if white_forecast.empty or pb_forecast.empty:
+        empty_tickets = pd.DataFrame(
+            columns=[
+                "ticket",
+                "white_numbers",
+                "powerball",
+                "sim_count",
+                "sim_prob",
+                "empirical_freq_score",
+                "statistical_weight_score",
+                "overlap_penalty",
+                "ticket_score",
+            ]
+        )
+        return {
+            "tickets": empty_tickets,
+            "white_number_freq": pd.DataFrame(columns=["number", "sim_count", "sim_rate"]),
+            "powerball_freq": pd.DataFrame(columns=["number", "sim_count", "sim_rate"]),
+            "pair_freq": pd.DataFrame(columns=["pair", "sim_count", "sim_rate"]),
+            "triplet_freq": pd.DataFrame(columns=["triplet", "sim_count", "sim_rate"]),
+        }
+
+    rng = np.random.default_rng(int(seed))
+    white_numbers = white_forecast["number"].to_numpy(dtype=int)
+    white_p = white_forecast["draw_prob"].to_numpy(dtype=float)
+    white_draw_prob_map = white_forecast.set_index("number")["draw_prob"].to_dict()
+    white_emp_map = white_forecast.set_index("number")["observed_active_era"].astype(float).to_dict()
+
+    pb_numbers = pb_forecast["number"].to_numpy(dtype=int)
+    pb_p = pb_forecast["draw_prob"].to_numpy(dtype=float)
+    pb_prob_map = pb_forecast.set_index("number")["draw_prob"].to_dict()
+    pb_emp_map = pb_forecast.set_index("number")["observed_active_era"].astype(float).to_dict()
+
+    ticket_counter = Counter()
+    white_counter = Counter()
+    pb_counter = Counter()
+    pair_counter = Counter()
+    triplet_counter = Counter()
+
+    for _ in range(int(n_samples)):
+        w = tuple(sorted(rng.choice(white_numbers, size=5, replace=False, p=white_p).tolist()))
+        pb = int(rng.choice(pb_numbers, size=1, replace=True, p=pb_p)[0])
+        ticket_counter[(w, pb)] += 1
+        for n in w:
+            white_counter[n] += 1
+        pb_counter[pb] += 1
+        for p in combinations(w, 2):
+            pair_counter[p] += 1
+        for t in combinations(w, 3):
+            triplet_counter[t] += 1
+
+    candidate_rows = []
+    candidate_pool = max(int(top_n) * 30, 300)
+    for (w, pb), cnt in ticket_counter.most_common(candidate_pool):
+        empirical_raw = float(np.mean([white_emp_map.get(n, 0.0) for n in w] + [pb_emp_map.get(pb, 0.0)]))
+        stat_log = float(np.sum([np.log(max(white_draw_prob_map.get(n, 1e-12), 1e-12)) for n in w]) + np.log(max(pb_prob_map.get(pb, 1e-12), 1e-12)))
+        candidate_rows.append(
+            {
+                "white_tuple": w,
+                "powerball": pb,
+                "sim_count": int(cnt),
+                "sim_prob": cnt / n_samples,
+                "empirical_raw": empirical_raw,
+                "statistical_raw": stat_log,
+            }
+        )
+    candidates = pd.DataFrame(candidate_rows)
+    if candidates.empty:
+        return {
+            "tickets": pd.DataFrame(),
+            "white_number_freq": pd.DataFrame(),
+            "powerball_freq": pd.DataFrame(),
+            "pair_freq": pd.DataFrame(),
+            "triplet_freq": pd.DataFrame(),
+        }
+
+    candidates["empirical_freq_score"] = _minmax_scale(candidates["empirical_raw"].to_numpy(dtype=float))
+    candidates["statistical_weight_score"] = _minmax_scale(candidates["statistical_raw"].to_numpy(dtype=float))
+    candidates["base_score"] = 0.45 * candidates["empirical_freq_score"] + 0.55 * candidates["statistical_weight_score"]
+
+    selected_rows = []
+    selected_tuples: list[tuple[tuple[int, ...], int]] = []
+    remaining = candidates.copy()
+    select_n = min(int(top_n), len(remaining))
+    for _ in range(select_n):
+        if remaining.empty:
+            break
+        if not selected_tuples:
+            remaining["overlap_penalty"] = 0.0
+            remaining["ticket_score"] = remaining["base_score"]
+        else:
+            penalties = []
+            for _, row in remaining.iterrows():
+                w = set(row["white_tuple"])
+                pb = int(row["powerball"])
+                max_overlap = 0.0
+                for sw, spb in selected_tuples:
+                    white_overlap = len(w.intersection(set(sw))) / 5.0
+                    pb_overlap = 0.25 if pb == int(spb) else 0.0
+                    max_overlap = max(max_overlap, white_overlap + pb_overlap)
+                penalties.append(max_overlap)
+            remaining["overlap_penalty"] = penalties
+            remaining["ticket_score"] = remaining["base_score"] - float(overlap_lambda) * remaining["overlap_penalty"]
+
+        best_idx = remaining["ticket_score"].idxmax()
+        best = remaining.loc[best_idx].copy()
+        selected_rows.append(best)
+        selected_tuples.append((tuple(int(n) for n in best["white_tuple"]), int(best["powerball"])))
+        remaining = remaining.drop(index=best_idx)
+
+    selected = pd.DataFrame(selected_rows).reset_index(drop=True)
+    if selected.empty:
+        ticket_df = pd.DataFrame(columns=["ticket", "white_numbers", "powerball", "sim_count", "sim_prob", "empirical_freq_score", "statistical_weight_score", "overlap_penalty", "ticket_score"])
+    else:
+        selected["white_numbers"] = selected["white_tuple"].apply(lambda t: " - ".join(str(int(n)) for n in t))
+        selected["ticket"] = selected["white_numbers"] + " | PB " + selected["powerball"].astype(int).astype(str)
+        ticket_df = selected[
+            [
+                "ticket",
+                "white_numbers",
+                "powerball",
+                "sim_count",
+                "sim_prob",
+                "empirical_freq_score",
+                "statistical_weight_score",
+                "overlap_penalty",
+                "ticket_score",
+            ]
+        ].copy()
+        ticket_df["powerball"] = ticket_df["powerball"].astype(int)
+        ticket_df["sim_count"] = ticket_df["sim_count"].astype(int)
+
+    white_freq = _build_sim_count_df(white_counter, "number")
+    pb_freq = _build_sim_count_df(pb_counter, "number")
+    pair_freq = _build_sim_count_df(Counter({f"{a}-{b}": c for (a, b), c in pair_counter.items()}), "pair")
+    triplet_freq = _build_sim_count_df(Counter({f"{a}-{b}-{c}": c for (a, b, c), c in triplet_counter.items()}), "triplet")
+    if not white_freq.empty:
+        white_freq["number"] = white_freq["number"].astype(int)
+    if not pb_freq.empty:
+        pb_freq["number"] = pb_freq["number"].astype(int)
+
+    return {
+        "tickets": ticket_df.sort_values("ticket_score", ascending=False).reset_index(drop=True),
+        "white_number_freq": white_freq,
+        "powerball_freq": pb_freq,
+        "pair_freq": pair_freq,
+        "triplet_freq": triplet_freq,
+    }
+
+
 def simulate_forecast_tickets(
     white_forecast: pd.DataFrame,
     pb_forecast: pd.DataFrame,
     n_samples: int = 8000,
     top_n: int = 12,
     seed: int = 42,
+    overlap_lambda: float = 0.35,
 ) -> pd.DataFrame:
-    if white_forecast.empty or pb_forecast.empty:
-        return pd.DataFrame(columns=["white_numbers", "powerball", "sim_count", "sim_prob", "ticket_score"])
-
-    rng = np.random.default_rng(int(seed))
-    white_numbers = white_forecast["number"].to_numpy(dtype=int)
-    white_p = white_forecast["draw_prob"].to_numpy(dtype=float)
-    white_incl = white_forecast.set_index("number")["inclusion_prob_next_draw"].to_dict()
-
-    pb_numbers = pb_forecast["number"].to_numpy(dtype=int)
-    pb_p = pb_forecast["draw_prob"].to_numpy(dtype=float)
-    pb_prob_map = pb_forecast.set_index("number")["draw_prob"].to_dict()
-
-    counter = Counter()
-    for _ in range(int(n_samples)):
-        w = tuple(sorted(rng.choice(white_numbers, size=5, replace=False, p=white_p).tolist()))
-        pb = int(rng.choice(pb_numbers, size=1, replace=True, p=pb_p)[0])
-        counter[(w, pb)] += 1
-
-    rows = []
-    for (w, pb), cnt in counter.most_common(int(top_n)):
-        ticket_score = float(np.prod([white_incl[n] for n in w]) * pb_prob_map[pb])
-        rows.append(
-            {
-                "white_numbers": " - ".join(str(n) for n in w),
-                "powerball": pb,
-                "sim_count": cnt,
-                "sim_prob": cnt / n_samples,
-                "ticket_score": ticket_score,
-            }
-        )
-    return pd.DataFrame(rows)
+    bundle = run_ticket_simulation_bundle(
+        white_forecast=white_forecast,
+        pb_forecast=pb_forecast,
+        n_samples=n_samples,
+        top_n=top_n,
+        seed=seed,
+        overlap_lambda=overlap_lambda,
+    )
+    return bundle["tickets"]
 
 
 def build_excel_export(
@@ -809,6 +966,10 @@ def build_excel_export(
     white_forecast: pd.DataFrame,
     pb_forecast: pd.DataFrame,
     tickets_forecast: pd.DataFrame,
+    sim_white_number_freq: pd.DataFrame,
+    sim_powerball_freq: pd.DataFrame,
+    sim_pair_freq: pd.DataFrame,
+    sim_triplet_freq: pd.DataFrame,
     sim_df: pd.DataFrame,
 ) -> bytes:
     output = io.BytesIO()
@@ -833,6 +994,14 @@ def build_excel_export(
             pb_forecast.to_excel(writer, sheet_name="forecast_pb", index=False)
         if not tickets_forecast.empty:
             tickets_forecast.to_excel(writer, sheet_name="forecast_tickets", index=False)
+        if not sim_white_number_freq.empty:
+            sim_white_number_freq.to_excel(writer, sheet_name="sim_white_number_freq", index=False)
+        if not sim_powerball_freq.empty:
+            sim_powerball_freq.to_excel(writer, sheet_name="sim_pb_number_freq", index=False)
+        if not sim_pair_freq.empty:
+            sim_pair_freq.to_excel(writer, sheet_name="sim_pair_freq", index=False)
+        if not sim_triplet_freq.empty:
+            sim_triplet_freq.to_excel(writer, sheet_name="sim_triplet_freq", index=False)
         if not sim_df.empty:
             sim_df.to_excel(writer, sheet_name="physical_sim", index=False)
     output.seek(0)
@@ -1013,9 +1182,10 @@ weight_gap = st.sidebar.slider("Gap (overdue)", min_value=0.0, max_value=1.0, va
 st.sidebar.header("Forecast Settings")
 forecast_strength_white = st.sidebar.slider("White forecast strength", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
 forecast_strength_pb = st.sidebar.slider("PB forecast strength", min_value=0.0, max_value=1.0, value=0.30, step=0.05)
-forecast_samples = st.sidebar.slider("Ticket simulation samples", min_value=1000, max_value=30000, value=8000, step=1000)
+forecast_samples = st.sidebar.slider("Ticket simulation samples", min_value=5000, max_value=200000, value=50000, step=5000)
 forecast_top_tickets = st.sidebar.slider("Top simulated tickets", min_value=5, max_value=25, value=12, step=1)
 forecast_seed = st.sidebar.number_input("Forecast random seed", min_value=1, max_value=999999, value=42, step=1)
+overlap_penalty_lambda = st.sidebar.slider("Overlap penalty (diversity)", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
 
 st.sidebar.header("Navegacion")
 page = st.sidebar.radio(
@@ -1086,13 +1256,19 @@ pb_forecast = statistical_forecast_pb(
     pb_over=pb_over,
     strength=forecast_strength_pb,
 )
-tickets_forecast = simulate_forecast_tickets(
+ticket_sim_bundle = run_ticket_simulation_bundle(
     white_forecast=white_forecast,
     pb_forecast=pb_forecast,
     n_samples=int(forecast_samples),
     top_n=int(forecast_top_tickets),
     seed=int(forecast_seed),
+    overlap_lambda=float(overlap_penalty_lambda),
 )
+tickets_forecast = ticket_sim_bundle["tickets"]
+sim_white_number_freq = ticket_sim_bundle["white_number_freq"]
+sim_powerball_freq = ticket_sim_bundle["powerball_freq"]
+sim_pair_freq = ticket_sim_bundle["pair_freq"]
+sim_triplet_freq = ticket_sim_bundle["triplet_freq"]
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Draws", f"{len(filtered):,}")
@@ -1278,15 +1454,37 @@ if page == "Inicio (Forecast)":
         if len(white_ticket_base) < 5:
             white_ticket_base = white_forecast.copy()
             st.info("Rango white muy corto para tickets; simulacion usa el pool completo.")
-        tickets_view = simulate_forecast_tickets(
+        home_bundle = run_ticket_simulation_bundle(
             white_forecast=white_ticket_base,
             pb_forecast=pb_forecast,
             n_samples=int(forecast_samples),
             top_n=int(forecast_top_tickets),
             seed=int(forecast_seed),
+            overlap_lambda=float(overlap_penalty_lambda),
         )
-        st.markdown("**Combinaciones candidatas (simulacion ponderada)**")
+        tickets_view = home_bundle["tickets"]
+        white_sim_view = home_bundle["white_number_freq"]
+        pb_sim_view = home_bundle["powerball_freq"]
+        pair_sim_view = home_bundle["pair_freq"]
+        triplet_sim_view = home_bundle["triplet_freq"]
+
+        st.markdown("**Combinaciones candidatas (simulacion + score)**")
         st.dataframe(tickets_view, width="stretch", hide_index=True)
+        st.caption(
+            "Score separado por ticket: `empirical_freq_score`, `statistical_weight_score`, "
+            "`overlap_penalty`, `ticket_score`."
+        )
+        col_simfreq_a, col_simfreq_b = st.columns(2)
+        with col_simfreq_a:
+            st.markdown("**Frecuencia simulada: numeros white**")
+            st.dataframe(white_sim_view.head(view_n), width="stretch", hide_index=True)
+            st.markdown("**Frecuencia simulada: Powerball**")
+            st.dataframe(pb_sim_view.head(min(view_n, 20)), width="stretch", hide_index=True)
+        with col_simfreq_b:
+            st.markdown("**Frecuencia simulada: pares**")
+            st.dataframe(pair_sim_view.head(view_n), width="stretch", hide_index=True)
+            st.markdown("**Frecuencia simulada: tripletas**")
+            st.dataframe(triplet_sim_view.head(view_n), width="stretch", hide_index=True)
         forecast_csv = tickets_view.to_csv(index=False).encode("utf-8")
         st.download_button(
             "Download forecast tickets (CSV)",
@@ -1619,6 +1817,10 @@ else:
             white_forecast=white_forecast,
             pb_forecast=pb_forecast,
             tickets_forecast=tickets_forecast,
+            sim_white_number_freq=sim_white_number_freq,
+            sim_powerball_freq=sim_powerball_freq,
+            sim_pair_freq=sim_pair_freq,
+            sim_triplet_freq=sim_triplet_freq,
             sim_df=default_sim_df.sort_values("number").reset_index(drop=True),
         )
         st.download_button(
@@ -2060,7 +2262,7 @@ if not white_forecast.empty and not pb_forecast.empty:
         seed=int(forecast_seed),
     )
 
-    st.markdown("**Combinaciones candidatas (simulacion ponderada)**")
+    st.markdown("**Combinaciones candidatas (simulacion + score)**")
     st.dataframe(tickets_forecast, width="stretch", hide_index=True)
     forecast_csv = tickets_forecast.to_csv(index=False).encode("utf-8")
     st.download_button(
@@ -2226,6 +2428,10 @@ if OPENPYXL_OK:
         white_forecast=white_forecast,
         pb_forecast=pb_forecast,
         tickets_forecast=tickets_forecast,
+        sim_white_number_freq=sim_white_number_freq,
+        sim_powerball_freq=sim_powerball_freq,
+        sim_pair_freq=sim_pair_freq,
+        sim_triplet_freq=sim_triplet_freq,
         sim_df=sim_df.sort_values("number").reset_index(drop=True),
     )
     st.download_button(
