@@ -169,3 +169,25 @@ This module is explicitly exploratory:
 - It does **not** claim predictive power.
 - It is meant to compare how rankings would change under small hypothetical perturbations.
 - If no measured weights are uploaded, the app uses a transparent hypothetical signal and labels it as such.
+
+## 10. Accuracy v3 forecast policy
+The production forecast treats the five white balls as one unordered, fixed-size subset. Given positive
+weights `w`, the probability of a five-number set `S` is:
+
+`P(S | |S|=5) = product(w_i for i in S) / e_5(w)`
+
+where `e_5(w)` is the fifth elementary-symmetric sum. This provides exact marginal inclusion probabilities
+whose total is five and an exact sampler consistent with the displayed POP values.
+
+The forecast is mixed with the official uniform reference:
+
+`P_final = model_weight * P_model + (1 - model_weight) * P_uniform`
+
+Model strength and the initial weight are selected on the calibration period. A later holdout determines the
+evidence label from a bootstrap interval of Brier improvement:
+- `Evidencia de mejora`: retain the calibrated model weight.
+- `Mejora incierta`: retain only 25% of the calibrated model weight.
+- `Sin mejora`: use the uniform model.
+
+The dashboard also reports moving-block bootstrap intervals for next-draw POP. These ranges describe model
+uncertainty; they do not alter the official game odds.

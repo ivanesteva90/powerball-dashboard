@@ -65,13 +65,18 @@ where:
   - Forecast trained independently from visualization filters
   - Current-matrix-only training with Bayesian smoothing
   - No overdue/gap signal in the default forecast
-  - Model strength calibrated on early history and evaluated on a later holdout
-  - White inclusion rates estimated from the same without-replacement ticket simulation
+  - Model strength and historical weight calibrated on early history and evaluated on a later holdout
+  - Exact Conditional Bernoulli white-ball POP for fixed-size selections of five numbers
+  - Automatic shrinkage toward the uniform baseline when holdout evidence is weak or negative
+  - Moving-block bootstrap 95% intervals for white and Powerball POP
+  - Separate model POP, official uniform POP, simulation rate, and full-ticket official probability
+  - Holdout improvement intervals, model win rates, and explicit evidence labels
   - Data-clear block with winning/losing combinations:
     - Top exact tickets (5+PB)
     - One-hit losing tickets
     - Top white pairs and triplets
-  - Filter-aware candidate ticket simulation
+  - Filter-aware candidate ticket simulation using the same fixed-size model as the forecast
+  - Ticket portfolio diversity using overlap penalties and incremental number coverage
 - Rolling view now includes quick modes:
   - Manual
   - Top forecast
@@ -79,7 +84,7 @@ where:
   - Most overdue
 - CSV export of filtered data
 - Excel export with multi-sheet analytical outputs
-- Walk-forward backtest with Brier score, log-loss, top-k hits, yearly stability, and uniform baseline
+- Walk-forward backtest with Brier score, exact white subset log-loss, top-k hits, yearly stability, bootstrap uncertainty, and uniform baseline
 - Era-aware expected values for historical pairs and triplets
 - Unit tests for the pure forecast core in `powerball_core.py`
 
@@ -109,5 +114,7 @@ Texas CSV manual sync in-app uses:
 
 ## Notes
 - The exploration score is experimental and should be treated as a ranking aid, not a prediction engine.
+- Accuracy v3 deliberately keeps forecasts close to uniform unless out-of-sample improvement is statistically supported.
+- POP is a model estimate, while official ticket odds remain unchanged under a fair drawing.
 - The Physical Bias Simulator is sensitivity analysis only (uniform vs hypothetical/measured micro-bias), not predictive proof.
 - This dashboard is strongest for descriptive statistics, anomaly detection, and historical segmentation.

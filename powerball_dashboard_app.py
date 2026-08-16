@@ -2,6 +2,7 @@ import io
 from collections import Counter
 from datetime import datetime, timedelta
 from itertools import combinations
+from math import comb
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
@@ -16,7 +17,10 @@ import streamlit as st
 from powerball_core import (
     build_powerball_forecast,
     build_white_forecast,
+    conditional_bernoulli_normalizer,
     current_matrix_draws,
+    forecast_pop_intervals,
+    sample_conditional_bernoulli,
     walk_forward_backtest,
 )
 
@@ -702,12 +706,13 @@ def statistical_forecast_white(
     white_exp: pd.DataFrame,
     white_score: pd.DataFrame,
     strength: float = 0.025,
+    model_weight: float = 1.0,
 ) -> pd.DataFrame:
     del white_exp, white_score
-    result = build_white_forecast(filtered, strength=float(strength))
+    result = build_white_forecast(filtered, strength=float(strength), model_weight=float(model_weight))
     if not result.empty:
         result["draw_prob"] = result["draw_weight"]
-        result["inclusion_prob_next_draw"] = np.nan
+        result["inclusion_prob_next_draw"] = result["pop_next_draw"]
         result["z_score"] = result["forecast_signal"]
         result["recent_52_z"] = np.nan
         result["gap_z"] = np.nan
@@ -719,11 +724,12 @@ def statistical_forecast_pb(
     pb_exp: pd.DataFrame,
     pb_over: pd.DataFrame,
     strength: float = 0.025,
+    model_weight: float = 1.0,
 ) -> pd.DataFrame:
     del pb_exp, pb_over
-    result = build_powerball_forecast(filtered, strength=float(strength))
+    result = build_powerball_forecast(filtered, strength=float(strength), model_weight=float(model_weight))
     if not result.empty:
-        result["draw_prob"] = result["draw_weight"]
+        result["draw_prob"] = result["pop_next_draw"]
         result["z_score"] = result["forecast_signal"]
     return result
 
@@ -767,6 +773,9 @@ def run_ticket_simulation_bundle(
                 "empirical_freq_score",
                 "statistical_weight_score",
                 "overlap_penalty",
+                "coverage_gain",
+                "model_ticket_prob",
+                "official_ticket_prob",
                 "ticket_score",
             ]
         )
@@ -780,13 +789,18 @@ def run_ticket_simulation_bundle(
 
     rng = np.random.default_rng(int(seed))
     white_numbers = white_forecast["number"].to_numpy(dtype=int)
-    white_p = white_forecast["draw_prob"].to_numpy(dtype=float)
-    white_draw_prob_map = white_forecast.set_index("number")["draw_prob"].to_dict()
+    white_p = white_forecast["draw_weight"].to_numpy(dtype=float)
+    white_p = white_p / white_p.sum()
+    white_model_weight = float(white_forecast["model_weight"].iloc[0])
+    white_normalizer = conditional_bernoulli_normalizer(white_p, sample_size=5)
+    white_index_map = {int(number): index for index, number in enumerate(white_numbers)}
+    candidate_uniform_probability = 1 / comb(len(white_numbers), 5)
     white_emp_map = white_forecast.set_index("number")["observed_active_era"].astype(float).to_dict()
 
     pb_numbers = pb_forecast["number"].to_numpy(dtype=int)
-    pb_p = pb_forecast["draw_prob"].to_numpy(dtype=float)
-    pb_prob_map = pb_forecast.set_index("number")["draw_prob"].to_dict()
+    pb_p = pb_forecast["pop_next_draw"].to_numpy(dtype=float)
+    pb_p = pb_p / pb_p.sum()
+    pb_prob_map = pb_forecast.set_index("number")["pop_next_draw"].to_dict()
     pb_emp_map = pb_forecast.set_index("number")["observed_active_era"].astype(float).to_dict()
 
     ticket_counter = Counter()
@@ -795,8 +809,16 @@ def run_ticket_simulation_bundle(
     pair_counter = Counter()
     triplet_counter = Counter()
 
+    full_white_pool = int(round(5 / float(white_forecast["uniform_pop_next_draw"].iloc[0])))
+    full_pb_pool = int(round(1 / float(pb_forecast["uniform_pop_next_draw"].iloc[0])))
+    official_ticket_probability = 1 / (comb(full_white_pool, 5) * full_pb_pool)
+
     for _ in range(int(n_samples)):
-        w = tuple(sorted(rng.choice(white_numbers, size=5, replace=False, p=white_p).tolist()))
+        if rng.random() < white_model_weight:
+            selected_indices = sample_conditional_bernoulli(white_p, sample_size=5, rng=rng)
+        else:
+            selected_indices = rng.choice(len(white_numbers), size=5, replace=False)
+        w = tuple(sorted(white_numbers[selected_indices].tolist()))
         pb = int(rng.choice(pb_numbers, size=1, replace=True, p=pb_p)[0])
         ticket_counter[(w, pb)] += 1
         for n in w:
@@ -810,7 +832,14 @@ def run_ticket_simulation_bundle(
     candidate_rows = []
     for (w, pb), cnt in ticket_counter.items():
         empirical_raw = float(np.mean([white_emp_map.get(n, 0.0) for n in w] + [pb_emp_map.get(pb, 0.0)]))
-        stat_log = float(np.sum([np.log(max(white_draw_prob_map.get(n, 1e-12), 1e-12)) for n in w]) + np.log(max(pb_prob_map.get(pb, 1e-12), 1e-12)))
+        subset_indices = np.asarray([white_index_map[int(number)] for number in w], dtype=int)
+        white_model_subset_probability = float(np.prod(white_p[subset_indices]) / white_normalizer)
+        white_final_subset_probability = (
+            white_model_weight * white_model_subset_probability
+            + (1 - white_model_weight) * candidate_uniform_probability
+        )
+        model_ticket_probability = white_final_subset_probability * float(pb_prob_map.get(pb, 0.0))
+        stat_log = float(np.log(max(model_ticket_probability, 1e-15)))
         candidate_rows.append(
             {
                 "white_tuple": w,
@@ -819,6 +848,8 @@ def run_ticket_simulation_bundle(
                 "sim_prob": cnt / n_samples,
                 "empirical_raw": empirical_raw,
                 "statistical_raw": stat_log,
+                "model_ticket_prob": model_ticket_probability,
+                "official_ticket_prob": official_ticket_probability,
             }
         )
     candidates = pd.DataFrame(candidate_rows)
@@ -839,6 +870,8 @@ def run_ticket_simulation_bundle(
 
     selected_rows = []
     selected_tuples: list[tuple[tuple[int, ...], int]] = []
+    covered_white: set[int] = set()
+    covered_pb: set[int] = set()
     remaining = candidates.copy()
     select_n = min(int(top_n), len(remaining))
     for _ in range(select_n):
@@ -846,9 +879,11 @@ def run_ticket_simulation_bundle(
             break
         if not selected_tuples:
             remaining["overlap_penalty"] = 0.0
-            remaining["ticket_score"] = remaining["base_score"]
+            remaining["coverage_gain"] = 1.0
+            remaining["ticket_score"] = remaining["base_score"] + 0.15
         else:
             penalties = []
+            coverage_gains = []
             for _, row in remaining.iterrows():
                 w = set(row["white_tuple"])
                 pb = int(row["powerball"])
@@ -858,18 +893,26 @@ def run_ticket_simulation_bundle(
                     pb_overlap = 0.25 if pb == int(spb) else 0.0
                     max_overlap = max(max_overlap, white_overlap + pb_overlap)
                 penalties.append(max_overlap)
+                coverage_gains.append(len(w.difference(covered_white)) / 5.0 + (0.25 if pb not in covered_pb else 0.0))
             remaining["overlap_penalty"] = penalties
-            remaining["ticket_score"] = remaining["base_score"] - float(overlap_lambda) * remaining["overlap_penalty"]
+            remaining["coverage_gain"] = coverage_gains
+            remaining["ticket_score"] = (
+                remaining["base_score"]
+                - float(overlap_lambda) * remaining["overlap_penalty"]
+                + 0.15 * remaining["coverage_gain"]
+            )
 
         best_idx = remaining["ticket_score"].idxmax()
         best = remaining.loc[best_idx].copy()
         selected_rows.append(best)
         selected_tuples.append((tuple(int(n) for n in best["white_tuple"]), int(best["powerball"])))
+        covered_white.update(int(n) for n in best["white_tuple"])
+        covered_pb.add(int(best["powerball"]))
         remaining = remaining.drop(index=best_idx)
 
     selected = pd.DataFrame(selected_rows).reset_index(drop=True)
     if selected.empty:
-        ticket_df = pd.DataFrame(columns=["ticket", "white_numbers", "powerball", "sim_count", "sim_prob", "empirical_freq_score", "statistical_weight_score", "overlap_penalty", "ticket_score"])
+        ticket_df = pd.DataFrame(columns=["ticket", "white_numbers", "powerball", "sim_count", "sim_prob", "empirical_freq_score", "statistical_weight_score", "overlap_penalty", "coverage_gain", "model_ticket_prob", "official_ticket_prob", "ticket_score"])
     else:
         selected["white_numbers"] = selected["white_tuple"].apply(lambda t: " - ".join(str(int(n)) for n in t))
         selected["ticket"] = selected["white_numbers"] + " | PB " + selected["powerball"].astype(int).astype(str)
@@ -883,6 +926,9 @@ def run_ticket_simulation_bundle(
                 "empirical_freq_score",
                 "statistical_weight_score",
                 "overlap_penalty",
+                "coverage_gain",
+                "model_ticket_prob",
+                "official_ticket_prob",
                 "ticket_score",
             ]
         ].copy()
@@ -1039,6 +1085,23 @@ def format_p(p):
 @st.cache_data(show_spinner=False)
 def cached_walk_forward_backtest(df: pd.DataFrame):
     return walk_forward_backtest(df)
+
+
+@st.cache_data(show_spinner=False)
+def cached_forecast_pop_intervals(
+    df: pd.DataFrame,
+    white_strength: float,
+    powerball_strength: float,
+    white_model_weight: float,
+    powerball_model_weight: float,
+):
+    return forecast_pop_intervals(
+        df,
+        white_strength=white_strength,
+        powerball_strength=powerball_strength,
+        white_model_weight=white_model_weight,
+        powerball_model_weight=powerball_model_weight,
+    )
 
 
 def build_navigation_guide() -> pd.DataFrame:
@@ -1218,6 +1281,8 @@ forecast_source = current_matrix_draws(df)
 backtest_detail, backtest_summary, backtest_yearly, backtest_config = cached_walk_forward_backtest(df)
 forecast_strength_white = float(backtest_config.white_strength)
 forecast_strength_pb = float(backtest_config.powerball_strength)
+forecast_model_weight_white = float(backtest_config.white_model_weight)
+forecast_model_weight_pb = float(backtest_config.powerball_model_weight)
 forecast_white_exp = add_significance_columns(mixed_expected_white(forecast_source))
 forecast_pb_exp = add_significance_columns(mixed_expected_powerball(forecast_source))
 forecast_white_score = trend_score_white(forecast_source, weight_long=0.65, weight_recent=0.35, weight_gap=0.0)
@@ -1226,13 +1291,26 @@ white_forecast = statistical_forecast_white(
     white_exp=forecast_white_exp,
     white_score=forecast_white_score,
     strength=forecast_strength_white,
+    model_weight=forecast_model_weight_white,
 )
 pb_forecast = statistical_forecast_pb(
     filtered=forecast_source,
     pb_exp=forecast_pb_exp,
     pb_over=overdue_powerball(forecast_source),
     strength=forecast_strength_pb,
+    model_weight=forecast_model_weight_pb,
 )
+white_pop_intervals, pb_pop_intervals = cached_forecast_pop_intervals(
+    forecast_source,
+    white_strength=forecast_strength_white,
+    powerball_strength=forecast_strength_pb,
+    white_model_weight=forecast_model_weight_white,
+    powerball_model_weight=forecast_model_weight_pb,
+)
+if not white_forecast.empty and not white_pop_intervals.empty:
+    white_forecast = white_forecast.merge(white_pop_intervals, on="number", how="left")
+if not pb_forecast.empty and not pb_pop_intervals.empty:
+    pb_forecast = pb_forecast.merge(pb_pop_intervals, on="number", how="left")
 ticket_sim_bundle = run_ticket_simulation_bundle(
     white_forecast=white_forecast,
     pb_forecast=pb_forecast,
@@ -1247,21 +1325,15 @@ sim_powerball_freq = ticket_sim_bundle["powerball_freq"]
 sim_pair_freq = ticket_sim_bundle["pair_freq"]
 sim_triplet_freq = ticket_sim_bundle["triplet_freq"]
 if not sim_white_number_freq.empty:
-    white_forecast = white_forecast.drop(columns=["inclusion_prob_next_draw"], errors="ignore").merge(
+    white_forecast = white_forecast.merge(
         sim_white_number_freq[["number", "appearance_rate"]].rename(
-            columns={"appearance_rate": "pop_next_draw"}
+            columns={"appearance_rate": "simulated_appearance_rate"}
         ),
         on="number",
         how="left",
     )
-    white_forecast["inclusion_prob_next_draw"] = white_forecast["pop_next_draw"]
-    white_forecast["pop_delta_pp"] = (
-        white_forecast["pop_next_draw"] - white_forecast["uniform_pop_next_draw"]
-    ) * 100
     white_forecast = white_forecast.sort_values("rank").reset_index(drop=True)
-elif not white_forecast.empty:
-    # Fallback if the simulation cannot run; this is an approximation only.
-    white_forecast["pop_next_draw"] = np.clip(5 * white_forecast["draw_prob"], 0, 1)
+if not white_forecast.empty:
     white_forecast["inclusion_prob_next_draw"] = white_forecast["pop_next_draw"]
     white_forecast["pop_delta_pp"] = (
         white_forecast["pop_next_draw"] - white_forecast["uniform_pop_next_draw"]
@@ -1302,8 +1374,18 @@ if page == "Inicio (Forecast)":
         "<div class='accuracy-note'><b>Cómo leer esta página:</b> el ranking resume señales históricas débiles. "
         "No cambia las probabilidades oficiales del juego. La confianza del modelo se calibra con sorteos "
         "anteriores y el atraso se muestra solo como dato descriptivo. <b>POP</b> significa probabilidad "
-        "estimada de que el número aparezca en el próximo sorteo.</div>",
+        "estimada de que el número aparezca en el próximo sorteo. Accuracy v3 calcula el POP white con una "
+        "selección exacta de cinco bolas y reduce automáticamente el peso histórico cuando el backtest no es "
+        "concluyente.</div>",
         unsafe_allow_html=True,
+    )
+    status1, status2, status3, status4 = st.columns(4)
+    status1.metric("Próximo sorteo (CT)", str(next_powerball_draw_day_ct(now_ct).date()))
+    status2.metric("Evidencia white", backtest_config.white_evidence)
+    status3.metric("Evidencia Powerball", backtest_config.powerball_evidence)
+    status4.metric(
+        "Peso histórico final",
+        f"W {backtest_config.white_model_weight:.0%} | PB {backtest_config.powerball_model_weight:.0%}",
     )
     with st.expander("Qué contiene cada sección"):
         st.dataframe(guide_df, width="stretch", hide_index=True)
@@ -1376,32 +1458,56 @@ if page == "Inicio (Forecast)":
             f"{1 / int(forecast_source.iloc[-1]['powerball_pool_max']):.2%} para cada Powerball."
         )
         pop_white_display = white_view.head(view_n)[
-            ["number", "pop_next_draw", "uniform_pop_next_draw", "pop_delta_pp", "draws_since_seen"]
+            [
+                "number",
+                "pop_next_draw",
+                "pop_ci_low",
+                "pop_ci_high",
+                "uniform_pop_next_draw",
+                "pop_delta_pp",
+                "draws_since_seen",
+            ]
         ].copy()
         pop_white_display.columns = [
             "Número white",
             "POP próximo sorteo",
+            "Rango bajo 95%",
+            "Rango alto 95%",
             "POP uniforme",
             "Diferencia",
             "Sorteos sin salir",
         ]
         pop_white_display["Número white"] = pop_white_display["Número white"].astype(int)
         pop_white_display["POP próximo sorteo"] = pop_white_display["POP próximo sorteo"].map("{:.2%}".format)
+        pop_white_display["Rango bajo 95%"] = pop_white_display["Rango bajo 95%"].map("{:.2%}".format)
+        pop_white_display["Rango alto 95%"] = pop_white_display["Rango alto 95%"].map("{:.2%}".format)
         pop_white_display["POP uniforme"] = pop_white_display["POP uniforme"].map("{:.2%}".format)
         pop_white_display["Diferencia"] = pop_white_display["Diferencia"].map(lambda value: f"{value:+.3f} pp")
 
         pop_pb_display = pb_view.head(min(view_n, 20))[
-            ["number", "pop_next_draw", "uniform_pop_next_draw", "pop_delta_pp", "draws_since_seen"]
+            [
+                "number",
+                "pop_next_draw",
+                "pop_ci_low",
+                "pop_ci_high",
+                "uniform_pop_next_draw",
+                "pop_delta_pp",
+                "draws_since_seen",
+            ]
         ].copy()
         pop_pb_display.columns = [
             "Powerball",
             "POP próximo sorteo",
+            "Rango bajo 95%",
+            "Rango alto 95%",
             "POP uniforme",
             "Diferencia",
             "Sorteos sin salir",
         ]
         pop_pb_display["Powerball"] = pop_pb_display["Powerball"].astype(int)
         pop_pb_display["POP próximo sorteo"] = pop_pb_display["POP próximo sorteo"].map("{:.2%}".format)
+        pop_pb_display["Rango bajo 95%"] = pop_pb_display["Rango bajo 95%"].map("{:.2%}".format)
+        pop_pb_display["Rango alto 95%"] = pop_pb_display["Rango alto 95%"].map("{:.2%}".format)
         pop_pb_display["POP uniforme"] = pop_pb_display["POP uniforme"].map("{:.2%}".format)
         pop_pb_display["Diferencia"] = pop_pb_display["Diferencia"].map(lambda value: f"{value:+.3f} pp")
 
@@ -1443,13 +1549,20 @@ if page == "Inicio (Forecast)":
                 "empirical_freq_score": "score_histórico",
                 "statistical_weight_score": "score_modelo",
                 "overlap_penalty": "solapamiento",
+                "coverage_gain": "ganancia_cobertura",
+                "model_ticket_prob": "prob_modelo_condicional",
+                "official_ticket_prob": "prob_oficial_ticket",
                 "ticket_score": "score_final",
             }
         )
-        st.dataframe(tickets_display.round(6), width="stretch", hide_index=True)
+        tickets_display["tasa_ticket"] = tickets_display["tasa_ticket"].map("{:.5%}".format)
+        tickets_display["prob_modelo_condicional"] = tickets_display["prob_modelo_condicional"].map("{:.3e}".format)
+        tickets_display["prob_oficial_ticket"] = tickets_display["prob_oficial_ticket"].map("{:.3e}".format)
+        st.dataframe(tickets_display, width="stretch", hide_index=True)
         st.caption(
-            "El score ordena candidatos dentro del modelo experimental. La penalización de solapamiento busca "
-            "que los tickets cubran números distintos; no aumenta la probabilidad individual de cada ticket."
+            "La probabilidad del modelo es condicional al rango white seleccionado. La probabilidad oficial de "
+            "cada ticket completo sigue siendo la misma. Solapamiento y ganancia de cobertura diversifican el "
+            "grupo de tickets; no aumentan la probabilidad oficial individual."
         )
         with st.expander("Ver frecuencias internas de la simulación"):
             col_simfreq_a, col_simfreq_b = st.columns(2)
@@ -1514,7 +1627,12 @@ if page == "Inicio (Forecast)":
                 x="number",
                 y="pop_next_draw",
                 title=f"White POP: {view_mode_white}",
-                hover_data={"draw_prob": ":.4f", "lift_vs_uniform_pct": ":.2f", "z_score": ":.2f"},
+                hover_data={
+                    "pop_ci_low": ":.2%",
+                    "pop_ci_high": ":.2%",
+                    "lift_vs_uniform_pct": ":.2f",
+                    "z_score": ":.2f",
+                },
             )
             fig.add_hline(
                 y=5 / active_pool_white,
@@ -1530,7 +1648,13 @@ if page == "Inicio (Forecast)":
                 x="number",
                 y="pop_next_draw",
                 title=f"Powerball POP: {view_mode_pb}",
-                hover_data={"lift_vs_uniform_pct": ":.2f", "z_score": ":.2f", "draws_since_seen": True},
+                hover_data={
+                    "pop_ci_low": ":.2%",
+                    "pop_ci_high": ":.2%",
+                    "lift_vs_uniform_pct": ":.2f",
+                    "z_score": ":.2f",
+                    "draws_since_seen": True,
+                },
             )
             pb_uniform_pop = 1 / int(forecast_source.iloc[-1]["powerball_pool_max"])
             fig.add_hline(
@@ -1550,6 +1674,8 @@ if page == "Inicio (Forecast)":
                         "rank",
                         "number",
                         "pop_next_draw",
+                        "pop_ci_low",
+                        "pop_ci_high",
                         "uniform_pop_next_draw",
                         "pop_delta_pp",
                         "draw_prob",
@@ -1568,6 +1694,8 @@ if page == "Inicio (Forecast)":
                         "rank",
                         "number",
                         "pop_next_draw",
+                        "pop_ci_low",
+                        "pop_ci_high",
                         "uniform_pop_next_draw",
                         "pop_delta_pp",
                         "lift_vs_uniform_pct",
@@ -1595,40 +1723,55 @@ elif page == "Validacion (Backtest)":
         bt2.metric("Sorteos fuera de muestra", f"{backtest_config.holdout_draws:,}")
         bt3.metric("Intensidad white", f"{backtest_config.white_strength:.3f}")
         bt4.metric("Intensidad Powerball", f"{backtest_config.powerball_strength:.3f}")
-
-        def validation_label(row):
-            improvement = float(row["relative_improvement_pct"])
-            if improvement >= 1.0:
-                return "Mejora visible"
-            if improvement > 0:
-                return "Diferencia mínima"
-            return "No supera uniforme"
-
-        white_result = validation_label(white_brier)
-        pb_result = validation_label(pb_brier)
-        result_col1, result_col2 = st.columns(2)
-        result_col1.metric("Calibración white", white_result, f"Δ Brier {white_brier['delta']:+.6f}")
-        result_col2.metric("Calibración Powerball", pb_result, f"Δ Brier {pb_brier['delta']:+.6f}")
+        result_col1, result_col2, result_col3, result_col4 = st.columns(4)
+        result_col1.metric("Evidencia white", str(white_brier["evidence"]), f"Δ Brier {white_brier['delta']:+.6f}")
+        result_col2.metric("Evidencia Powerball", str(pb_brier["evidence"]), f"Δ Brier {pb_brier['delta']:+.6f}")
+        result_col3.metric(
+            "Peso white",
+            f"{backtest_config.white_model_weight:.0%}",
+            f"Calibrado {backtest_config.white_calibrated_weight:.0%}",
+        )
+        result_col4.metric(
+            "Peso Powerball",
+            f"{backtest_config.powerball_model_weight:.0%}",
+            f"Calibrado {backtest_config.powerball_calibrated_weight:.0%}",
+        )
 
         st.markdown(
             "<div class='accuracy-note'><b>Regla de lectura:</b> Brier y log-loss deben ser menores que el "
-            "uniforme. Los hits top-k deben ser mayores. Una mejora aislada no demuestra capacidad predictiva; "
-            "también debe mantenerse entre años.</div>",
+            "uniforme. El intervalo de mejora debe quedar sobre cero para marcar evidencia. Si incluye cero, "
+            "Accuracy v3 conserva solo 25% del peso calibrado; si el promedio no mejora, usa el uniforme.</div>",
             unsafe_allow_html=True,
         )
 
         summary_view = backtest_summary[
-            ["metric", "uniform", "model", "delta", "relative_improvement_pct", "beats_uniform"]
+            [
+                "metric",
+                "uniform",
+                "model",
+                "delta",
+                "improvement_ci_low",
+                "improvement_ci_high",
+                "model_win_rate",
+                "relative_improvement_pct",
+                "evidence",
+            ]
         ].copy()
-        summary_view[["uniform", "model", "delta"]] = summary_view[["uniform", "model", "delta"]].round(6)
+        summary_view[["uniform", "model", "delta", "improvement_ci_low", "improvement_ci_high"]] = summary_view[
+            ["uniform", "model", "delta", "improvement_ci_low", "improvement_ci_high"]
+        ].round(6)
+        summary_view["model_win_rate"] = summary_view["model_win_rate"].map("{:.1%}".format)
         summary_view = summary_view.rename(
             columns={
                 "metric": "métrica",
                 "uniform": "uniforme",
                 "model": "modelo",
                 "delta": "diferencia",
+                "improvement_ci_low": "mejora_intervalo_bajo",
+                "improvement_ci_high": "mejora_intervalo_alto",
+                "model_win_rate": "ventanas_ganadas",
                 "relative_improvement_pct": "mejora_relativa_pct",
-                "beats_uniform": "supera_uniforme",
+                "evidence": "evidencia",
             }
         )
         st.dataframe(summary_view, width="stretch", hide_index=True)
