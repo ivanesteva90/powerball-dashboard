@@ -68,6 +68,14 @@ where:
   - Pre-test overlap compared with its uniform expectation
   - Walk-forward machine+set validation with hierarchical shrinkage
   - Equipment signals remain outside POP unless future out-of-sample evidence supports them
+- Play-plan section:
+  - Ticket-count or per-draw budget input
+  - Editable ticket cost, draws per week, and 1-30 year horizon
+  - Exact per-draw, annual, and cumulative jackpot coverage
+  - Per-draw, weekly, annual, and horizon cost
+  - Side-by-side scenarios for 0, 1, 3, 5, 10, 25, and 50 tickets
+  - Downloadable low-overlap candidate portfolio constrained by the selected budget
+  - Explicitly identifies zero tickets as the financial optimum when no stable edge exists
 - Physical Bias Simulator (experimental):
   - Uniform mode with no invented per-number weights
   - Explicit hypothetical target-ball stress scenarios around an 80 g nominal mass
@@ -131,5 +139,6 @@ Texas CSV manual sync in-app uses:
 - Accuracy v3 deliberately keeps forecasts close to uniform unless out-of-sample improvement is statistically supported.
 - POP is a model estimate, while official ticket odds remain unchanged under a fair drawing.
 - The current equipment walk-forward test does not beat the uniform reference, so machine/set data is diagnostic only.
+- The play-plan calculator improves budget control and combination coverage; it does not convert the forecast into a positive-expectation investment.
 - The Physical Bias Simulator is sensitivity analysis only (uniform vs explicit hypothetical/measured micro-bias), not predictive proof.
 - This dashboard is strongest for descriptive statistics, anomaly detection, and historical segmentation.

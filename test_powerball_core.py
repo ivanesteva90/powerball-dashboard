@@ -7,6 +7,7 @@ import pandas as pd
 from powerball_core import (
     build_powerball_forecast,
     build_white_forecast,
+    calculate_play_plan,
     conditional_bernoulli_inclusion_probabilities,
     conditional_bernoulli_subset_probability,
     current_matrix_draws,
@@ -112,6 +113,22 @@ class PowerballCoreTests(unittest.TestCase):
         self.assertEqual(len(powerball), 26)
         self.assertTrue((white["pop_ci_low"] <= white["pop_ci_high"]).all())
         self.assertTrue((powerball["pop_ci_low"] <= powerball["pop_ci_high"]).all())
+
+    def test_play_plan_costs_and_probability_are_exact(self):
+        plan = calculate_play_plan(5, ticket_cost=2, draws_per_week=3, years=10)
+        self.assertEqual(plan["total_combinations"], 292_201_338)
+        self.assertAlmostEqual(plan["probability_per_draw"], 5 / 292_201_338, places=15)
+        self.assertEqual(plan["cost_per_draw"], 10)
+        self.assertEqual(plan["cost_per_week"], 30)
+        self.assertEqual(plan["cost_per_year"], 1560)
+        self.assertEqual(plan["cost_horizon"], 15600)
+        self.assertGreater(plan["probability_horizon"], plan["probability_per_year"])
+
+    def test_zero_ticket_play_plan_has_no_cost_or_probability(self):
+        plan = calculate_play_plan(0, ticket_cost=2, draws_per_week=3, years=10)
+        self.assertEqual(plan["probability_horizon"], 0)
+        self.assertEqual(plan["cost_horizon"], 0)
+        self.assertTrue(np.isinf(plan["one_in_horizon"]))
 
 
 if __name__ == "__main__":

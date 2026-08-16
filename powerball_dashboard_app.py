@@ -17,6 +17,7 @@ import streamlit as st
 from powerball_core import (
     build_powerball_forecast,
     build_white_forecast,
+    calculate_play_plan,
     conditional_bernoulli_normalizer,
     current_matrix_draws,
     forecast_pop_intervals,
@@ -1189,6 +1190,7 @@ def build_navigation_guide() -> pd.DataFrame:
     return pd.DataFrame(
         [
             ("Resumen y combinaciones", "Ranking, extremos y tickets candidatos."),
+            ("Plan de juego", "Presupuesto, tickets, probabilidad acumulada y portafolio."),
             ("Validación histórica", "Compara el modelo con el uniforme fuera de muestra."),
             ("Frecuencias", "Observado vs esperado, z-score y significancia."),
             ("Recencia", "Cuántos sorteos lleva cada número sin aparecer."),
@@ -1274,16 +1276,17 @@ else:
 
 PAGE_LABELS = {
     "Inicio (Forecast)": "1. Resumen y combinaciones",
-    "Validacion (Backtest)": "2. Validación histórica",
-    "Frecuencia y Significancia": "3. Frecuencias",
-    "Recencia (Overdue)": "4. Recencia",
-    "Estructura y Combinaciones": "5. Patrones y combinaciones",
-    "Diagnosticos": "6. Diagnósticos avanzados",
-    "Perfil y Calidad": "7. Calidad de datos",
-    "Rolling": "8. Evolución temporal",
-    "Equipos y Pre-tests": "9. Equipos y pre-tests",
-    "Simulador Fisico": "10. Laboratorio experimental",
-    "Datos y Exportes": "11. Datos y descargas",
+    "Plan de Juego": "2. Plan de juego",
+    "Validacion (Backtest)": "3. Validación histórica",
+    "Frecuencia y Significancia": "4. Frecuencias",
+    "Recencia (Overdue)": "5. Recencia",
+    "Estructura y Combinaciones": "6. Patrones y combinaciones",
+    "Diagnosticos": "7. Diagnósticos avanzados",
+    "Perfil y Calidad": "8. Calidad de datos",
+    "Rolling": "9. Evolución temporal",
+    "Equipos y Pre-tests": "10. Equipos y pre-tests",
+    "Simulador Fisico": "11. Laboratorio experimental",
+    "Datos y Exportes": "12. Datos y descargas",
 }
 st.sidebar.header("Secciones")
 page = st.sidebar.radio(
@@ -1813,6 +1816,237 @@ if page == "Inicio (Forecast)":
                 ].head(view_n),
                 width="stretch",
                 hide_index=True,
+            )
+
+elif page == "Plan de Juego":
+    st.subheader("Plan de juego")
+    st.markdown(
+        "<div class='accuracy-note'><b>Conclusión del proyecto:</b> no hay ventaja predictiva estable. Esta "
+        "página sirve para controlar costo, evitar tickets duplicados y medir exactamente la cobertura. El "
+        "óptimo financiero sigue siendo cero tickets.</div>",
+        unsafe_allow_html=True,
+    )
+    active_white_pool = int(forecast_source.iloc[-1]["white_pool_max"])
+    active_pb_pool = int(forecast_source.iloc[-1]["powerball_pool_max"])
+    input_a, input_b, input_c, input_d = st.columns(4)
+    with input_a:
+        plan_input_mode = st.radio(
+            "Definir por",
+            options=["Tickets", "Presupuesto por draw"],
+            horizontal=True,
+            key="play_plan_input_mode",
+        )
+    with input_b:
+        ticket_cost_input = st.number_input(
+            "Costo total por ticket ($)",
+            min_value=0.01,
+            max_value=20.0,
+            value=2.0,
+            step=0.5,
+            key="play_plan_ticket_cost",
+        )
+    with input_c:
+        plan_draws_per_week = st.slider(
+            "Draws por semana",
+            min_value=1,
+            max_value=3,
+            value=3,
+            key="play_plan_draws_week",
+        )
+    with input_d:
+        plan_years = st.slider(
+            "Horizonte (años)",
+            min_value=1,
+            max_value=30,
+            value=10,
+            key="play_plan_years",
+        )
+
+    if plan_input_mode == "Tickets":
+        plan_tickets = int(
+            st.slider(
+                "Tickets distintos por draw",
+                min_value=0,
+                max_value=50,
+                value=5,
+                step=1,
+                key="play_plan_tickets",
+            )
+        )
+        plan_budget_per_draw = plan_tickets * float(ticket_cost_input)
+    else:
+        plan_budget_per_draw = float(
+            st.number_input(
+                "Presupuesto máximo por draw ($)",
+                min_value=0.0,
+                max_value=1000.0,
+                value=10.0,
+                step=2.0,
+                key="play_plan_budget_draw",
+            )
+        )
+        plan_tickets = min(50, int(plan_budget_per_draw // float(ticket_cost_input)))
+        st.caption(
+            f"El presupuesto permite {plan_tickets} tickets completos; el portafolio se limita a 50 por draw."
+        )
+
+    play_plan = calculate_play_plan(
+        tickets_per_draw=plan_tickets,
+        ticket_cost=float(ticket_cost_input),
+        draws_per_week=int(plan_draws_per_week),
+        years=int(plan_years),
+        white_pool_size=active_white_pool,
+        powerball_pool_size=active_pb_pool,
+    )
+
+    def format_one_in(value: float) -> str:
+        return "N/A" if not np.isfinite(value) else f"1 en {value:,.0f}"
+
+    st.markdown("### Costo del plan")
+    cost1, cost2, cost3, cost4 = st.columns(4)
+    cost1.metric("Por draw", f"${play_plan['cost_per_draw']:,.2f}")
+    cost2.metric("Por semana", f"${play_plan['cost_per_week']:,.2f}")
+    cost3.metric("Por año", f"${play_plan['cost_per_year']:,.2f}")
+    cost4.metric(f"En {plan_years} años", f"${play_plan['cost_horizon']:,.2f}")
+
+    st.markdown("### Cobertura del jackpot")
+    probability1, probability2, probability3, probability4 = st.columns(4)
+    probability1.metric(
+        "Un draw",
+        f"{play_plan['probability_per_draw']:.8%}",
+        format_one_in(float(play_plan["one_in_per_draw"])),
+    )
+    probability2.metric(
+        "Un año",
+        f"{play_plan['probability_per_year']:.8%}",
+        format_one_in(float(play_plan["one_in_per_year"])),
+    )
+    probability3.metric(
+        f"{plan_years} años",
+        f"{play_plan['probability_horizon']:.8%}",
+        format_one_in(float(play_plan["one_in_horizon"])),
+    )
+    expected_years = float(play_plan["expected_years_to_jackpot"])
+    probability4.metric(
+        "Espera matemática media",
+        "N/A" if not np.isfinite(expected_years) else f"{expected_years:,.0f} años",
+        "No es una garantía",
+    )
+    st.caption(
+        "Supuestos: tickets completos distintos dentro de cada draw, matriz constante y sorteos independientes. "
+        "El proyecto no calcula aquí premios menores ni retorno esperado. El costo es editable; $2 es la referencia "
+        "actual sin extras."
+    )
+    st.markdown("[Verificar precio vigente del ticket](https://www.powerball.com/faqs?hl=en-US)")
+    if plan_tickets == 0:
+        st.success("Plan financiero óptimo: cero costo y cero exposición.")
+    elif float(play_plan["cost_per_year"]) > 1560:
+        st.warning(
+            "Este plan supera $1,560 al año. La cobertura aumenta linealmente con el costo, pero el proyecto no "
+            "ha demostrado una ventaja que justifique perseguir pérdidas."
+        )
+
+    st.markdown("### Comparar escenarios")
+    scenario_counts = sorted({0, 1, 3, 5, 10, 25, 50, int(plan_tickets)})
+    scenario_rows = []
+    for scenario_tickets in scenario_counts:
+        scenario = calculate_play_plan(
+            tickets_per_draw=scenario_tickets,
+            ticket_cost=float(ticket_cost_input),
+            draws_per_week=int(plan_draws_per_week),
+            years=int(plan_years),
+            white_pool_size=active_white_pool,
+            powerball_pool_size=active_pb_pool,
+        )
+        scenario_rows.append(
+            {
+                "tickets_por_draw": scenario_tickets,
+                "costo_draw": scenario["cost_per_draw"],
+                "costo_semanal": scenario["cost_per_week"],
+                "costo_anual": scenario["cost_per_year"],
+                f"costo_{plan_years}_años": scenario["cost_horizon"],
+                "probabilidad_anual": scenario["probability_per_year"],
+                f"probabilidad_{plan_years}_años": scenario["probability_horizon"],
+                f"uno_en_{plan_years}_años": scenario["one_in_horizon"],
+            }
+        )
+    scenario_df = pd.DataFrame(scenario_rows)
+    scenario_display = scenario_df.copy()
+    for column in ["costo_draw", "costo_semanal", "costo_anual", f"costo_{plan_years}_años"]:
+        scenario_display[column] = scenario_display[column].map("${:,.2f}".format)
+    for column in ["probabilidad_anual", f"probabilidad_{plan_years}_años"]:
+        scenario_display[column] = scenario_display[column].map("{:.8%}".format)
+    scenario_display[f"uno_en_{plan_years}_años"] = scenario_display[f"uno_en_{plan_years}_años"].map(
+        lambda value: format_one_in(float(value))
+    )
+    st.dataframe(scenario_display, width="stretch", hide_index=True)
+
+    chart_scenarios = scenario_df[scenario_df["tickets_por_draw"] > 0].copy()
+    if not chart_scenarios.empty:
+        fig = px.scatter(
+            chart_scenarios,
+            x="costo_anual",
+            y=f"probabilidad_{plan_years}_años",
+            size="tickets_por_draw",
+            color="tickets_por_draw",
+            text="tickets_por_draw",
+            title=f"Costo anual frente a probabilidad acumulada en {plan_years} años",
+        )
+        fig.update_traces(textposition="top center")
+        fig.update_layout(height=380, xaxis_title="Costo anual ($)", yaxis_tickformat=".6%")
+        st.plotly_chart(fig, width="stretch")
+
+    st.markdown("### Portafolio de combinaciones")
+    if plan_tickets <= 0:
+        st.info("Plan en cero tickets: no se genera portafolio ni costo.")
+    elif white_forecast.empty or pb_forecast.empty:
+        st.info("El forecast no está disponible para generar combinaciones.")
+    else:
+        with st.spinner("Generando tickets distintos con penalización de solapamiento..."):
+            plan_bundle = run_ticket_simulation_bundle(
+                white_forecast=white_forecast,
+                pb_forecast=pb_forecast,
+                n_samples=max(50000, int(forecast_samples)),
+                top_n=int(plan_tickets),
+                seed=int(forecast_seed),
+                overlap_lambda=float(overlap_penalty_lambda),
+            )
+        plan_portfolio = plan_bundle["tickets"].copy()
+        if plan_portfolio.empty:
+            st.info("La simulación no produjo suficientes combinaciones para el plan.")
+        else:
+            plan_portfolio.insert(0, "ticket_n", np.arange(1, len(plan_portfolio) + 1))
+            plan_display = plan_portfolio[
+                [
+                    "ticket_n",
+                    "white_numbers",
+                    "powerball",
+                    "overlap_penalty",
+                    "coverage_gain",
+                    "ticket_score",
+                ]
+            ].rename(
+                columns={
+                    "white_numbers": "white",
+                    "powerball": "PB",
+                    "overlap_penalty": "solapamiento",
+                    "coverage_gain": "ganancia_cobertura",
+                    "ticket_score": "score_exploratorio",
+                }
+            )
+            plan_display[["solapamiento", "ganancia_cobertura", "score_exploratorio"]] = plan_display[
+                ["solapamiento", "ganancia_cobertura", "score_exploratorio"]
+            ].round(4)
+            st.dataframe(plan_display, width="stretch", hide_index=True)
+            st.caption(
+                "Todos los tickets completos distintos tienen la misma probabilidad de jackpot bajo un sorteo "
+                "justo. El score ordena señales exploratorias; solapamiento y cobertura diversifican el conjunto."
+            )
+            st.download_button(
+                "Descargar mi plan de tickets",
+                plan_display.to_csv(index=False).encode("utf-8"),
+                file_name="powerball_play_plan.csv",
+                mime="text/csv",
             )
 
 elif page == "Validacion (Backtest)":

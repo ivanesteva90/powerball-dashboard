@@ -29,6 +29,58 @@ class BacktestConfig:
     holdout_start: pd.Timestamp
 
 
+def calculate_play_plan(
+    tickets_per_draw: int,
+    ticket_cost: float = 2.0,
+    draws_per_week: int = 3,
+    years: int = 1,
+    white_pool_size: int = 69,
+    powerball_pool_size: int = 26,
+) -> dict[str, float | int]:
+    """Calculate cost and jackpot coverage for distinct full tickets."""
+    tickets = max(0, int(tickets_per_draw))
+    cost = max(0.0, float(ticket_cost))
+    weekly_draws = max(0, int(draws_per_week))
+    horizon_years = max(0, int(years))
+    total_combinations = comb(int(white_pool_size), 5) * int(powerball_pool_size)
+    tickets = min(tickets, total_combinations)
+    annual_draws = 52 * weekly_draws
+    horizon_draws = annual_draws * horizon_years
+    probability_per_draw = tickets / total_combinations
+
+    def cumulative_probability(draw_count: int) -> float:
+        if probability_per_draw <= 0 or draw_count <= 0:
+            return 0.0
+        if probability_per_draw >= 1:
+            return 1.0
+        return float(-np.expm1(draw_count * np.log1p(-probability_per_draw)))
+
+    annual_probability = cumulative_probability(annual_draws)
+    horizon_probability = cumulative_probability(horizon_draws)
+    expected_years = (
+        total_combinations / (tickets * annual_draws)
+        if tickets > 0 and annual_draws > 0
+        else np.inf
+    )
+    return {
+        "tickets_per_draw": tickets,
+        "total_combinations": total_combinations,
+        "annual_draws": annual_draws,
+        "horizon_draws": horizon_draws,
+        "probability_per_draw": probability_per_draw,
+        "probability_per_year": annual_probability,
+        "probability_horizon": horizon_probability,
+        "one_in_per_draw": 1 / probability_per_draw if probability_per_draw > 0 else np.inf,
+        "one_in_per_year": 1 / annual_probability if annual_probability > 0 else np.inf,
+        "one_in_horizon": 1 / horizon_probability if horizon_probability > 0 else np.inf,
+        "cost_per_draw": tickets * cost,
+        "cost_per_week": tickets * cost * weekly_draws,
+        "cost_per_year": tickets * cost * annual_draws,
+        "cost_horizon": tickets * cost * horizon_draws,
+        "expected_years_to_jackpot": expected_years,
+    }
+
+
 def _standardize(values: np.ndarray) -> np.ndarray:
     values = np.asarray(values, dtype=float)
     std = float(np.std(values, ddof=0))

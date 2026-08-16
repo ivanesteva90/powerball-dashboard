@@ -213,3 +213,18 @@ Result on the current 5/69 + PB26 era through the available equipment report:
 Therefore machine/set and pre-test information remains a retrospective integrity diagnostic. It is not part
 of the next-draw POP unless a future preregistered out-of-sample test produces stable positive evidence and
 the equipment selection is available before the relevant ticket-sales cutoff.
+
+## 12. Play-plan mathematics
+For `k` distinct full tickets in one draw under a `5/69 + 1/26` matrix:
+
+`P(jackpot in one draw) = k / (C(69,5) * 26)`
+
+For `d` independent draws:
+
+`P(at least one jackpot) = 1 - (1 - P(draw))^d`
+
+The dashboard uses stable `log1p`/`expm1` evaluation for this cumulative probability and computes cost from
+the user-selected ticket price and schedule. Candidate portfolios penalize overlap and reward incremental
+coverage, but the dashboard explicitly keeps that portfolio score separate from the jackpot probability.
+Because the validated forecast has no stable positive edge, zero tickets remains the financial optimum;
+positive ticket counts are treated as an entertainment budget rather than an investment recommendation.
