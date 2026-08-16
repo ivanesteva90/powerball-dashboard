@@ -75,6 +75,75 @@ st.markdown(
         padding: 0.8rem 1rem;
         border-radius: 0 10px 10px 0;
     }
+    .ticket-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(310px, 1fr));
+        gap: 0.8rem;
+        margin: 0.7rem 0 1rem 0;
+    }
+    .ticket-card {
+        background: linear-gradient(145deg, #ffffff, #f3f6fa);
+        border: 1px solid #dce3ec;
+        border-radius: 16px;
+        padding: 0.85rem 0.95rem;
+        box-shadow: 0 8px 20px rgba(24, 39, 75, 0.06);
+    }
+    .ticket-label {
+        color: #667085;
+        font-size: 0.78rem;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        margin-bottom: 0.55rem;
+        text-transform: uppercase;
+    }
+    .ball-row {display: flex; align-items: center; flex-wrap: wrap; gap: 0.42rem;}
+    .number-ball {
+        align-items: center;
+        background: #ffffff;
+        border: 1px solid #cfd7e3;
+        border-radius: 999px;
+        color: #182230;
+        display: inline-flex;
+        font-size: 0.92rem;
+        font-weight: 800;
+        height: 2.25rem;
+        justify-content: center;
+        width: 2.25rem;
+    }
+    .number-ball.powerball {background: #e63946; border-color: #e63946; color: #ffffff;}
+    .pb-divider {color: #98a2b3; font-size: 0.75rem; font-weight: 700; margin: 0 0.15rem;}
+    .mobile-tip {display: none;}
+    @media (max-width: 768px) {
+        .block-container {padding: 0.8rem 0.75rem 2.5rem 0.75rem; max-width: 100%;}
+        h1 {font-size: 1.65rem !important; line-height: 1.15 !important;}
+        h2, h3 {line-height: 1.2 !important;}
+        [data-testid="stHorizontalBlock"] {flex-wrap: wrap !important; gap: 0.55rem !important;}
+        [data-testid="column"] {flex: 1 1 100% !important; min-width: 100% !important; width: 100% !important;}
+        [data-testid="stMetric"] {padding: 0.7rem 0.85rem; min-height: auto;}
+        [data-testid="stMetricValue"] {font-size: 1.35rem;}
+        [data-testid="stDataFrame"] {max-width: 100%; overflow-x: auto;}
+        [data-testid="stPlotlyChart"] {max-width: 100%; overflow: hidden;}
+        [data-testid="stDownloadButton"] button, .stButton button {min-height: 2.8rem; width: 100%;}
+        [role="radiogroup"] {flex-wrap: wrap !important; gap: 0.35rem 0.75rem !important;}
+        .accuracy-note, .data-ok {font-size: 0.92rem; padding: 0.7rem 0.8rem;}
+        .ticket-grid {grid-template-columns: 1fr; gap: 0.65rem;}
+        .ticket-card {padding: 0.75rem;}
+        .number-ball {font-size: 0.88rem; height: 2.12rem; width: 2.12rem;}
+        .mobile-tip {
+            background: #eef4ff;
+            border-radius: 10px;
+            color: #344054;
+            display: block;
+            font-size: 0.84rem;
+            margin: 0.35rem 0 0.8rem 0;
+            padding: 0.55rem 0.7rem;
+        }
+    }
+    @media (max-width: 390px) {
+        .block-container {padding-left: 0.55rem; padding-right: 0.55rem;}
+        .number-ball {font-size: 0.82rem; height: 1.95rem; width: 1.95rem;}
+        .ball-row {gap: 0.3rem;}
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -1154,6 +1223,25 @@ def format_p(p):
     return f"{p:.4f}"
 
 
+def render_ticket_cards(tickets: pd.DataFrame, limit: int = 12) -> None:
+    if tickets.empty or not {"white_numbers", "powerball"}.issubset(tickets.columns):
+        return
+    cards = []
+    for position, (_, row) in enumerate(tickets.head(int(limit)).iterrows(), start=1):
+        whites = [int(value.strip()) for value in str(row["white_numbers"]).split("-")]
+        white_balls = "".join(f'<span class="number-ball">{number}</span>' for number in whites)
+        powerball = int(row["powerball"])
+        cards.append(
+            '<div class="ticket-card">'
+            f'<div class="ticket-label">Ticket {position}</div>'
+            '<div class="ball-row">'
+            f'{white_balls}<span class="pb-divider">PB</span>'
+            f'<span class="number-ball powerball">{powerball}</span>'
+            "</div></div>"
+        )
+    st.markdown(f'<div class="ticket-grid">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
 @st.cache_data(show_spinner=False)
 def cached_walk_forward_backtest(df: pd.DataFrame):
     return walk_forward_backtest(df)
@@ -1208,6 +1296,11 @@ def build_navigation_guide() -> pd.DataFrame:
 
 st.title("Powerball: análisis y forecast")
 st.caption("Datos oficiales, validación histórica y combinaciones exploratorias en una sola vista.")
+st.markdown(
+    '<div class="mobile-tip">Usa el menú superior izquierdo para cambiar de sección. '
+    "Las tablas técnicas pueden desplazarse horizontalmente.</div>",
+    unsafe_allow_html=True,
+)
 
 sample_path = Path(__file__).with_name("powerball.csv")
 now_ct = texas_now_ct()
@@ -1669,7 +1762,15 @@ if page == "Inicio (Forecast)":
         tickets_display["tasa_ticket"] = tickets_display["tasa_ticket"].map("{:.5%}".format)
         tickets_display["prob_modelo_condicional"] = tickets_display["prob_modelo_condicional"].map("{:.3e}".format)
         tickets_display["prob_oficial_ticket"] = tickets_display["prob_oficial_ticket"].map("{:.3e}".format)
-        st.dataframe(tickets_display, width="stretch", hide_index=True)
+        render_ticket_cards(tickets_view, limit=min(12, len(tickets_view)))
+        tickets_compact = tickets_display[["combinación", "solapamiento", "ganancia_cobertura"]].copy()
+        tickets_compact.insert(0, "ticket_n", np.arange(1, len(tickets_compact) + 1))
+        tickets_compact[["solapamiento", "ganancia_cobertura"]] = tickets_compact[
+            ["solapamiento", "ganancia_cobertura"]
+        ].round(4)
+        st.dataframe(tickets_compact, width="stretch", hide_index=True)
+        with st.expander("Ver scores y probabilidades técnicas"):
+            st.dataframe(tickets_display, width="stretch", hide_index=True)
         st.caption(
             "La probabilidad del modelo es condicional al rango white seleccionado. La probabilidad oficial de "
             "cada ticket completo sigue siendo la misma. Solapamiento y ganancia de cobertura diversifican el "
@@ -2016,6 +2117,9 @@ elif page == "Plan de Juego":
             st.info("La simulación no produjo suficientes combinaciones para el plan.")
         else:
             plan_portfolio.insert(0, "ticket_n", np.arange(1, len(plan_portfolio) + 1))
+            render_ticket_cards(plan_portfolio, limit=min(12, len(plan_portfolio)))
+            if len(plan_portfolio) > 12:
+                st.caption(f"Se muestran 12 tarjetas; la tabla y el CSV contienen los {len(plan_portfolio)} tickets.")
             plan_display = plan_portfolio[
                 [
                     "ticket_n",
@@ -2037,7 +2141,13 @@ elif page == "Plan de Juego":
             plan_display[["solapamiento", "ganancia_cobertura", "score_exploratorio"]] = plan_display[
                 ["solapamiento", "ganancia_cobertura", "score_exploratorio"]
             ].round(4)
-            st.dataframe(plan_display, width="stretch", hide_index=True)
+            st.dataframe(
+                plan_display[["ticket_n", "white", "PB"]],
+                width="stretch",
+                hide_index=True,
+            )
+            with st.expander("Ver detalle técnico del portafolio"):
+                st.dataframe(plan_display, width="stretch", hide_index=True)
             st.caption(
                 "Todos los tickets completos distintos tienen la misma probabilidad de jackpot bajo un sorteo "
                 "justo. El score ordena señales exploratorias; solapamiento y cobertura diversifican el conjunto."

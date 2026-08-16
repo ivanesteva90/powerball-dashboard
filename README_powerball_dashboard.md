@@ -31,6 +31,12 @@ where:
 
 ## Features
 - Numbered sidebar navigation with independent sections, including a dedicated historical-validation page.
+- Responsive mobile layout:
+  - Single-column stacking below 768 px
+  - Full-width touch controls and download buttons
+  - Compact metrics, margins, charts, and scrollable technical tables
+  - Visual number-ball cards for forecast and play-plan tickets
+  - Compact ticket tables with technical scores moved into expandable details
 - Upload CSV directly in the app
 - Automatic official data sync from Texas Lottery CSV with a six-hour cache and manual refresh:
   - Source: `https://www.texaslottery.com/export/sites/lottery/Games/Powerball/Winning_Numbers/powerball.csv`
