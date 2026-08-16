@@ -127,6 +127,7 @@ def build_white_forecast(
             "draws_since_seen": gaps,
             "forecast_signal": signal,
             "draw_weight": draw_weight,
+            "uniform_pop_next_draw": np.repeat(5 / pool_size, pool_size),
             "lift_vs_uniform_pct": (draw_weight / (1 / pool_size) - 1) * 100,
         }
     )
@@ -157,6 +158,8 @@ def build_powerball_forecast(
             "draws_since_seen": gaps,
             "forecast_signal": signal,
             "draw_weight": draw_weight,
+            "pop_next_draw": draw_weight,
+            "uniform_pop_next_draw": np.repeat(1 / pool_size, pool_size),
             "lift_vs_uniform_pct": (draw_weight / (1 / pool_size) - 1) * 100,
         }
     )

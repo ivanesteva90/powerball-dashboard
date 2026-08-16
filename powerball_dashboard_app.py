@@ -1249,12 +1249,23 @@ sim_triplet_freq = ticket_sim_bundle["triplet_freq"]
 if not sim_white_number_freq.empty:
     white_forecast = white_forecast.drop(columns=["inclusion_prob_next_draw"], errors="ignore").merge(
         sim_white_number_freq[["number", "appearance_rate"]].rename(
-            columns={"appearance_rate": "inclusion_prob_next_draw"}
+            columns={"appearance_rate": "pop_next_draw"}
         ),
         on="number",
         how="left",
     )
+    white_forecast["inclusion_prob_next_draw"] = white_forecast["pop_next_draw"]
+    white_forecast["pop_delta_pp"] = (
+        white_forecast["pop_next_draw"] - white_forecast["uniform_pop_next_draw"]
+    ) * 100
     white_forecast = white_forecast.sort_values("rank").reset_index(drop=True)
+elif not white_forecast.empty:
+    # Fallback if the simulation cannot run; this is an approximation only.
+    white_forecast["pop_next_draw"] = np.clip(5 * white_forecast["draw_prob"], 0, 1)
+    white_forecast["inclusion_prob_next_draw"] = white_forecast["pop_next_draw"]
+    white_forecast["pop_delta_pp"] = (
+        white_forecast["pop_next_draw"] - white_forecast["uniform_pop_next_draw"]
+    ) * 100
 if not sim_powerball_freq.empty:
     pb_forecast = pb_forecast.merge(
         sim_powerball_freq[["number", "appearance_rate"]].rename(
@@ -1264,6 +1275,10 @@ if not sim_powerball_freq.empty:
         how="left",
     )
     pb_forecast = pb_forecast.sort_values("rank").reset_index(drop=True)
+if not pb_forecast.empty:
+    pb_forecast["pop_delta_pp"] = (
+        pb_forecast["pop_next_draw"] - pb_forecast["uniform_pop_next_draw"]
+    ) * 100
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Fuente activa", data_source_label)
@@ -1286,7 +1301,8 @@ if page == "Inicio (Forecast)":
     st.markdown(
         "<div class='accuracy-note'><b>Cómo leer esta página:</b> el ranking resume señales históricas débiles. "
         "No cambia las probabilidades oficiales del juego. La confianza del modelo se calibra con sorteos "
-        "anteriores y el atraso se muestra solo como dato descriptivo.</div>",
+        "anteriores y el atraso se muestra solo como dato descriptivo. <b>POP</b> significa probabilidad "
+        "estimada de que el número aparezca en el próximo sorteo.</div>",
         unsafe_allow_html=True,
     )
     with st.expander("Qué contiene cada sección"):
@@ -1328,23 +1344,23 @@ if page == "Inicio (Forecast)":
             (white_forecast["number"] >= white_range_filter[0]) & (white_forecast["number"] <= white_range_filter[1])
         ].copy()
         if view_mode_white == "Mayor señal":
-            white_view = white_filtered.sort_values("inclusion_prob_next_draw", ascending=False)
+            white_view = white_filtered.sort_values("pop_next_draw", ascending=False)
         elif view_mode_white == "Menor señal":
-            white_view = white_filtered.sort_values("inclusion_prob_next_draw", ascending=True)
+            white_view = white_filtered.sort_values("pop_next_draw", ascending=True)
         else:
             white_view = white_filtered.sort_values("draws_since_seen", ascending=False)
 
         if view_mode_pb == "Mayor señal":
-            pb_view = pb_forecast.sort_values("draw_prob", ascending=False)
+            pb_view = pb_forecast.sort_values("pop_next_draw", ascending=False)
         elif view_mode_pb == "Menor señal":
-            pb_view = pb_forecast.sort_values("draw_prob", ascending=True)
+            pb_view = pb_forecast.sort_values("pop_next_draw", ascending=True)
         else:
             pb_view = pb_forecast.sort_values("draws_since_seen", ascending=False)
 
-        top_white = white_forecast.sort_values("inclusion_prob_next_draw", ascending=False).head(5)["number"].tolist()
-        low_white = white_forecast.sort_values("inclusion_prob_next_draw", ascending=True).head(5)["number"].tolist()
-        top_pb = pb_forecast.sort_values("draw_prob", ascending=False).head(3)["number"].tolist()
-        low_pb = pb_forecast.sort_values("draw_prob", ascending=True).head(3)["number"].tolist()
+        top_white = white_forecast.sort_values("pop_next_draw", ascending=False).head(5)["number"].tolist()
+        low_white = white_forecast.sort_values("pop_next_draw", ascending=True).head(5)["number"].tolist()
+        top_pb = pb_forecast.sort_values("pop_next_draw", ascending=False).head(3)["number"].tolist()
+        low_pb = pb_forecast.sort_values("pop_next_draw", ascending=True).head(3)["number"].tolist()
         fw1, fw2, fw3 = st.columns(3)
         fw1.metric("Matriz actual", f"5/1-{int(forecast_source.iloc[-1]['white_pool_max'])}")
         fw2.metric("Mayor señal white", ", ".join(str(n) for n in top_white))
@@ -1352,6 +1368,50 @@ if page == "Inicio (Forecast)":
         fp1, fp2 = st.columns(2)
         fp1.metric("Mayor señal PB", ", ".join(str(n) for n in top_pb))
         fp2.metric("Menor señal PB", ", ".join(str(n) for n in low_pb))
+
+        st.markdown("### POP del próximo sorteo")
+        st.caption(
+            "POP es una estimación del modelo basada en el histórico. La referencia uniforme oficial es "
+            f"{5 / active_pool_white:.2%} para cada bola white y "
+            f"{1 / int(forecast_source.iloc[-1]['powerball_pool_max']):.2%} para cada Powerball."
+        )
+        pop_white_display = white_view.head(view_n)[
+            ["number", "pop_next_draw", "uniform_pop_next_draw", "pop_delta_pp", "draws_since_seen"]
+        ].copy()
+        pop_white_display.columns = [
+            "Número white",
+            "POP próximo sorteo",
+            "POP uniforme",
+            "Diferencia",
+            "Sorteos sin salir",
+        ]
+        pop_white_display["Número white"] = pop_white_display["Número white"].astype(int)
+        pop_white_display["POP próximo sorteo"] = pop_white_display["POP próximo sorteo"].map("{:.2%}".format)
+        pop_white_display["POP uniforme"] = pop_white_display["POP uniforme"].map("{:.2%}".format)
+        pop_white_display["Diferencia"] = pop_white_display["Diferencia"].map(lambda value: f"{value:+.3f} pp")
+
+        pop_pb_display = pb_view.head(min(view_n, 20))[
+            ["number", "pop_next_draw", "uniform_pop_next_draw", "pop_delta_pp", "draws_since_seen"]
+        ].copy()
+        pop_pb_display.columns = [
+            "Powerball",
+            "POP próximo sorteo",
+            "POP uniforme",
+            "Diferencia",
+            "Sorteos sin salir",
+        ]
+        pop_pb_display["Powerball"] = pop_pb_display["Powerball"].astype(int)
+        pop_pb_display["POP próximo sorteo"] = pop_pb_display["POP próximo sorteo"].map("{:.2%}".format)
+        pop_pb_display["POP uniforme"] = pop_pb_display["POP uniforme"].map("{:.2%}".format)
+        pop_pb_display["Diferencia"] = pop_pb_display["Diferencia"].map(lambda value: f"{value:+.3f} pp")
+
+        pop_col_white, pop_col_pb = st.columns(2)
+        with pop_col_white:
+            st.markdown(f"**White: {view_mode_white}**")
+            st.dataframe(pop_white_display, width="stretch", hide_index=True)
+        with pop_col_pb:
+            st.markdown(f"**Powerball: {view_mode_pb}**")
+            st.dataframe(pop_pb_display, width="stretch", hide_index=True)
 
         white_ticket_base = white_filtered.copy()
         if len(white_ticket_base) < 5:
@@ -1452,21 +1512,34 @@ if page == "Inicio (Forecast)":
             fig = px.bar(
                 white_view.head(view_n),
                 x="number",
-                y="inclusion_prob_next_draw",
-                title=f"White: {view_mode_white}",
+                y="pop_next_draw",
+                title=f"White POP: {view_mode_white}",
                 hover_data={"draw_prob": ":.4f", "lift_vs_uniform_pct": ":.2f", "z_score": ":.2f"},
             )
-            fig.update_layout(height=340, yaxis_title="Frecuencia de inclusión simulada")
+            fig.add_hline(
+                y=5 / active_pool_white,
+                line_dash="dash",
+                annotation_text=f"Uniforme {5 / active_pool_white:.2%}",
+            )
+            fig.update_layout(height=340, yaxis_title="POP próximo sorteo")
+            fig.update_yaxes(tickformat=".1%")
             st.plotly_chart(fig, width="stretch")
         with col_fw_b:
             fig = px.bar(
                 pb_view.head(min(20, view_n)),
                 x="number",
-                y="draw_prob",
-                title=f"Powerball: {view_mode_pb}",
+                y="pop_next_draw",
+                title=f"Powerball POP: {view_mode_pb}",
                 hover_data={"lift_vs_uniform_pct": ":.2f", "z_score": ":.2f", "draws_since_seen": True},
             )
-            fig.update_layout(height=340, yaxis_title="Probabilidad")
+            pb_uniform_pop = 1 / int(forecast_source.iloc[-1]["powerball_pool_max"])
+            fig.add_hline(
+                y=pb_uniform_pop,
+                line_dash="dash",
+                annotation_text=f"Uniforme {pb_uniform_pop:.2%}",
+            )
+            fig.update_layout(height=340, yaxis_title="POP próximo sorteo")
+            fig.update_yaxes(tickformat=".1%")
             st.plotly_chart(fig, width="stretch")
 
         col_fw_c, col_fw_d = st.columns(2)
@@ -1476,7 +1549,9 @@ if page == "Inicio (Forecast)":
                     [
                         "rank",
                         "number",
-                        "inclusion_prob_next_draw",
+                        "pop_next_draw",
+                        "uniform_pop_next_draw",
+                        "pop_delta_pp",
                         "draw_prob",
                         "lift_vs_uniform_pct",
                         "z_score",
@@ -1492,7 +1567,9 @@ if page == "Inicio (Forecast)":
                     [
                         "rank",
                         "number",
-                        "draw_prob",
+                        "pop_next_draw",
+                        "uniform_pop_next_draw",
+                        "pop_delta_pp",
                         "lift_vs_uniform_pct",
                         "z_score",
                         "draws_since_seen",

@@ -40,12 +40,15 @@ class PowerballCoreTests(unittest.TestCase):
         forecast = build_white_forecast(self.df, strength=0.025)
         self.assertEqual(len(forecast), 69)
         self.assertAlmostEqual(float(forecast["draw_weight"].sum()), 1.0, places=10)
+        self.assertTrue(np.allclose(forecast["uniform_pop_next_draw"], 5 / 69))
         self.assertTrue(forecast["number"].between(1, 69).all())
 
     def test_powerball_forecast_weights_sum_to_one(self):
         forecast = build_powerball_forecast(self.df, strength=0.025)
         self.assertEqual(len(forecast), 26)
         self.assertAlmostEqual(float(forecast["draw_weight"].sum()), 1.0, places=10)
+        self.assertAlmostEqual(float(forecast["pop_next_draw"].sum()), 1.0, places=10)
+        self.assertTrue(np.allclose(forecast["uniform_pop_next_draw"], 1 / 26))
         self.assertTrue(forecast["number"].between(1, 26).all())
 
     def test_walk_forward_backtest_uses_later_holdout(self):
