@@ -32,6 +32,7 @@ where:
 ## Features
 - Numbered sidebar navigation with independent sections, including a dedicated historical-validation page.
 - Responsive mobile layout:
+  - Consistent light theme on devices configured for dark mode
   - Single-column stacking below 768 px
   - Full-width touch controls and download buttons
   - Compact metrics, margins, charts, and scrollable technical tables

@@ -61,7 +61,10 @@ st.markdown(
         padding: 14px 16px;
         box-shadow: 0 8px 24px rgba(24, 39, 75, 0.05);
     }
-    [data-testid="stSidebar"] {background: #f4f7fb;}
+    [data-testid="stSidebar"] {
+        background: #f4f7fb;
+        color: #182230;
+    }
     .accuracy-note {
         border-left: 4px solid #e63946;
         background: #fff5f5;
