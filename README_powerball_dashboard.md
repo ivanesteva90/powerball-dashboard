@@ -5,8 +5,11 @@ This Streamlit dashboard loads a historical Powerball CSV and normalizes mixed h
 ## Files
 - `powerball_dashboard_app.py` — main Streamlit app
 - `powerball_core.py` — pure forecast and walk-forward validation logic
+- `powerball_equipment.py` — official pre-test parser and equipment analysis
 - `test_powerball_core.py` — unit tests for the forecast core
+- `test_powerball_equipment.py` — unit tests for equipment parsing and validation
 - `powerball.csv` — sample historical file
+- `powerball_pretests.csv` — normalized local fallback for the official pre-test report
 - `POWERBALL_ANALYTICAL_STUDY.md` — formulas, methodology, and findings for the uploaded file
 - `requirements_powerball_dashboard.txt` — Python dependencies
 
@@ -32,6 +35,11 @@ where:
 - Automatic official data sync from Texas Lottery CSV with a six-hour cache and manual refresh:
   - Source: `https://www.texaslottery.com/export/sites/lottery/Games/Powerball/Winning_Numbers/powerball.csv`
   - Bundled local CSV is used as a fallback if the official source is unavailable
+- Automatic Powerball pre-test/equipment sync with the same refresh control:
+  - Source: `https://cdn.powerball.com/v01/media/powerball-pre-test.pdf`
+  - Extracts draw order, machine IDs, ball-set IDs, pre-tests, official draws, and post-tests
+  - Audits number agreement against the Texas winning-number CSV
+  - Bundled normalized CSV is used as a fallback
 - Auto-parse rows with and without `Power Play`
 - Filter by era, year, weekday, and date range
 - Observed vs expected counts
@@ -54,11 +62,17 @@ where:
   - Out-of-range white numbers by era
   - Out-of-range Powerball by era
 - Composite exploration score with tunable weights for descriptive views only
+- Equipment and pre-test section:
+  - Machine/set usage history
+  - Number deviations by machine or set with FDR correction
+  - Pre-test overlap compared with its uniform expectation
+  - Walk-forward machine+set validation with hierarchical shrinkage
+  - Equipment signals remain outside POP unless future out-of-sample evidence supports them
 - Physical Bias Simulator (experimental):
-  - Uniform mode
-  - Weight bias mode
-  - Weight + wear mode
+  - Uniform mode with no invented per-number weights
+  - Explicit hypothetical target-ball stress scenarios around an 80 g nominal mass
   - Optional measured weights upload (`number,weight`)
+  - Sensitivity coefficient is user-controlled and never enters the production POP
 - Forecast section now includes:
   - Filterable views (`Mas probables`, `Menos probables`, `Mas atrasadas`, `Mas frias`)
   - White number range filter
@@ -86,7 +100,7 @@ where:
 - Excel export with multi-sheet analytical outputs
 - Walk-forward backtest with Brier score, exact white subset log-loss, top-k hits, yearly stability, bootstrap uncertainty, and uniform baseline
 - Era-aware expected values for historical pairs and triplets
-- Unit tests for the pure forecast core in `powerball_core.py`
+- Unit tests for forecast and equipment parsing/validation
 
 ## Install
 ```bash
@@ -100,7 +114,7 @@ streamlit run powerball_dashboard_app.py
 
 ## Test
 ```bash
-python3 -m unittest -v test_powerball_core.py
+python3 -m unittest discover -v
 ```
 
 ## GitHub + Live (Streamlit Community Cloud)
@@ -116,5 +130,6 @@ Texas CSV manual sync in-app uses:
 - The exploration score is experimental and should be treated as a ranking aid, not a prediction engine.
 - Accuracy v3 deliberately keeps forecasts close to uniform unless out-of-sample improvement is statistically supported.
 - POP is a model estimate, while official ticket odds remain unchanged under a fair drawing.
-- The Physical Bias Simulator is sensitivity analysis only (uniform vs hypothetical/measured micro-bias), not predictive proof.
+- The current equipment walk-forward test does not beat the uniform reference, so machine/set data is diagnostic only.
+- The Physical Bias Simulator is sensitivity analysis only (uniform vs explicit hypothetical/measured micro-bias), not predictive proof.
 - This dashboard is strongest for descriptive statistics, anomaly detection, and historical segmentation.

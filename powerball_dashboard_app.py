@@ -23,6 +23,17 @@ from powerball_core import (
     sample_conditional_bernoulli,
     walk_forward_backtest,
 )
+from powerball_equipment import (
+    POWERBALL_PRETEST_PDF_URL,
+    build_hypothetical_weight_table,
+    download_pretest_pdf,
+    equipment_number_deviation,
+    equipment_usage_summary,
+    equipment_walk_forward_backtest,
+    join_winning_draws_with_equipment,
+    parse_pretest_pdf_bytes,
+    pretest_draw_comparison,
+)
 
 try:
     from scipy.stats import chi2, norm
@@ -70,6 +81,7 @@ st.markdown(
 
 WHITE_COLS = ["num1", "num2", "num3", "num4", "num5"]
 TEXAS_POWERBALL_CSV_URL = "https://www.texaslottery.com/export/sites/lottery/Games/Powerball/Winning_Numbers/powerball.csv"
+PRETEST_LOCAL_FILENAME = "powerball_pretests.csv"
 POWERBALL_DRAW_WEEKDAYS = {0, 2, 5}  # Monday, Wednesday, Saturday (Texas Lottery schedule)
 
 
@@ -370,6 +382,36 @@ def load_official_powerball() -> pd.DataFrame:
     return parse_powerball_csv_bytes(download_texas_powerball_csv())
 
 
+@st.cache_data(ttl=6 * 60 * 60, show_spinner=False)
+def load_official_pretests() -> pd.DataFrame:
+    return parse_pretest_pdf_bytes(download_pretest_pdf())
+
+
+@st.cache_data(show_spinner=False)
+def load_local_pretests(file_mtime_ns: int | None = None, file_size: int | None = None) -> pd.DataFrame:
+    del file_mtime_ns, file_size
+    path = Path(__file__).with_name(PRETEST_LOCAL_FILENAME)
+    if not path.exists():
+        return pd.DataFrame()
+    result = pd.read_csv(path, parse_dates=["draw_date"])
+    integer_columns = [
+        "white_1",
+        "white_2",
+        "white_3",
+        "white_4",
+        "white_5",
+        "white_machine_id",
+        "white_ball_set_id",
+        "powerball",
+        "power_play",
+        "powerball_machine_id",
+        "powerball_ball_set_id",
+    ]
+    for column in integer_columns:
+        result[column] = pd.to_numeric(result[column], errors="coerce").astype("Int64")
+    return result
+
+
 def overdue_white(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["number", "draws_since_seen", "last_seen"])
@@ -616,6 +658,12 @@ def parse_weights_csv_bytes(raw_bytes: bytes, max_number: int) -> tuple[pd.DataF
     full["weight"] = full["weight"].fillna(fill_value)
     std = full["weight"].std(ddof=0) or 1.0
     full["weight_z"] = (full["weight"] - full["weight"].mean()) / std
+    full["weight_delta_pct"] = np.where(
+        full["weight"].mean() > 0,
+        (full["weight"] / full["weight"].mean() - 1) * 100,
+        0.0,
+    )
+    full["weight_source"] = "CSV de pesos medidos"
     return full, missing_count
 
 
@@ -635,32 +683,46 @@ def physical_bias_projection(
     total_observed = sim["observed"].sum()
     sim["baseline_prob"] = np.where(total_expected > 0, sim["expected"] / total_expected, 1 / len(sim))
 
-    if include_weight:
-        if measured_weights is not None:
-            merged = sim[["number"]].merge(measured_weights[["number", "weight_z"]], on="number", how="left")
-            z_weight = merged["weight_z"].fillna(0).to_numpy()
-            source = "measured"
+    weight_delta_pct = np.zeros(len(sim))
+    source = "uniforme: sin mediciones"
+    if include_weight and measured_weights is not None:
+        weight_columns = ["number", "weight"]
+        if "weight_delta_pct" in measured_weights.columns:
+            weight_columns.append("weight_delta_pct")
+        merged = sim[["number"]].merge(measured_weights[weight_columns], on="number", how="left")
+        if "weight_delta_pct" in merged.columns:
+            weight_delta_pct = merged["weight_delta_pct"].fillna(0).to_numpy(dtype=float)
         else:
-            std_num = sim["number"].std(ddof=0) or 1.0
-            z_weight = ((sim["number"] - sim["number"].mean()) / std_num).to_numpy()
-            source = "hypothetical"
-    else:
-        z_weight = np.zeros(len(sim))
-        source = "none"
+            mean_weight = float(merged["weight"].mean())
+            weight_delta_pct = np.where(
+                mean_weight > 0,
+                (merged["weight"].fillna(mean_weight).to_numpy(dtype=float) / mean_weight - 1) * 100,
+                0.0,
+            )
+        if "weight_source" in measured_weights.columns and measured_weights["weight_source"].notna().any():
+            source = str(measured_weights["weight_source"].dropna().iloc[0])
+        else:
+            source = "CSV de pesos medidos"
 
-    if include_wear:
-        freq_std = sim["observed"].std(ddof=0) or 1.0
-        z_wear = ((sim["observed"] - sim["observed"].mean()) / freq_std).to_numpy()
-    else:
-        z_wear = np.zeros(len(sim))
+    wear_delta_pct = np.zeros(len(sim))
+    if include_wear and measured_weights is not None and "wear_delta_pct" in measured_weights.columns:
+        wear_merged = sim[["number"]].merge(
+            measured_weights[["number", "wear_delta_pct"]], on="number", how="left"
+        )
+        wear_delta_pct = wear_merged["wear_delta_pct"].fillna(0).to_numpy(dtype=float)
 
-    logits = np.log(np.clip(sim["baseline_prob"].to_numpy(), 1e-12, None)) + beta * z_weight + gamma * z_wear
+    # beta/gamma are sensitivity coefficients per percentage point, not measured physical laws.
+    logits = (
+        np.log(np.clip(sim["baseline_prob"].to_numpy(), 1e-12, None))
+        - beta * weight_delta_pct
+        - gamma * wear_delta_pct
+    )
     shifted = logits - logits.max()
     raw = np.exp(shifted)
     adjusted_prob = raw / raw.sum()
 
-    sim["weight_signal_z"] = z_weight
-    sim["wear_signal_z"] = z_wear
+    sim["weight_delta_pct"] = weight_delta_pct
+    sim["wear_delta_pct"] = wear_delta_pct
     sim["adjusted_prob"] = adjusted_prob
     sim["adjusted_expected"] = adjusted_prob * total_observed
     sim["prob_lift_pct"] = np.where(
@@ -996,6 +1058,9 @@ def build_excel_export(
     sim_pair_freq: pd.DataFrame,
     sim_triplet_freq: pd.DataFrame,
     sim_df: pd.DataFrame,
+    equipment_rows: pd.DataFrame,
+    equipment_quality: pd.DataFrame,
+    equipment_backtest: pd.DataFrame,
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -1029,6 +1094,12 @@ def build_excel_export(
             sim_triplet_freq.to_excel(writer, sheet_name="sim_triplet_freq", index=False)
         if not sim_df.empty:
             sim_df.to_excel(writer, sheet_name="physical_sim", index=False)
+        if not equipment_rows.empty:
+            equipment_rows.to_excel(writer, sheet_name="equipment_pretests", index=False)
+        if not equipment_quality.empty:
+            equipment_quality.to_excel(writer, sheet_name="equipment_quality", index=False)
+        if not equipment_backtest.empty:
+            equipment_backtest.to_excel(writer, sheet_name="equipment_backtest", index=False)
     output.seek(0)
     return output.getvalue()
 
@@ -1104,6 +1175,16 @@ def cached_forecast_pop_intervals(
     )
 
 
+@st.cache_data(show_spinner=False)
+def cached_equipment_backtest(equipment_rows: pd.DataFrame):
+    return equipment_walk_forward_backtest(equipment_rows)
+
+
+@st.cache_data(show_spinner=False)
+def cached_pretest_comparison(equipment_rows: pd.DataFrame):
+    return pretest_draw_comparison(equipment_rows)
+
+
 def build_navigation_guide() -> pd.DataFrame:
     return pd.DataFrame(
         [
@@ -1115,6 +1196,7 @@ def build_navigation_guide() -> pd.DataFrame:
             ("Diagnósticos avanzados", "Buckets, últimos dígitos y estabilidad entre eras."),
             ("Calidad de datos", "Filas inválidas, rangos y perfil del archivo."),
             ("Evolución temporal", "Frecuencia móvil de un número."),
+            ("Equipos y pre-tests", "Máquinas, sets, pruebas previas y validación retrospectiva."),
             ("Laboratorio experimental", "Escenarios físicos hipotéticos, separados del forecast."),
             ("Datos y descargas", "Datos filtrados y exportación CSV/Excel."),
         ],
@@ -1139,7 +1221,8 @@ if source_mode == "Subir mi CSV":
 
 with st.sidebar.expander("Datos oficiales", expanded=True):
     st.markdown(f"[Abrir CSV oficial de Texas Lottery]({TEXAS_POWERBALL_CSV_URL})")
-    st.caption("La fuente automática se renueva cada 6 horas. El botón fuerza una consulta inmediata.")
+    st.markdown(f"[Abrir reporte oficial de pre-tests]({POWERBALL_PRETEST_PDF_URL})")
+    st.caption("Resultados y pre-tests se renuevan cada 6 horas. El botón fuerza ambas consultas.")
     if st.button("Buscar actualización ahora", key="sync_texas_csv_button", use_container_width=True):
         load_official_powerball.clear()
         st.cache_data.clear()
@@ -1171,6 +1254,24 @@ if df is None or df.empty:
     st.info("Upload a CSV to begin.")
     st.stop()
 
+pretest_path = Path(__file__).with_name(PRETEST_LOCAL_FILENAME)
+try:
+    equipment_df = load_official_pretests()
+    equipment_source_label = "Powerball Pre-Test oficial"
+except Exception as exc:
+    equipment_df = load_local_pretests(
+        file_mtime_ns=int(pretest_path.stat().st_mtime_ns) if pretest_path.exists() else None,
+        file_size=int(pretest_path.stat().st_size) if pretest_path.exists() else None,
+    )
+    equipment_source_label = "Copia local de pre-tests"
+    if equipment_df.empty:
+        st.sidebar.warning(f"Pre-tests no disponibles: {exc}")
+
+if not equipment_df.empty:
+    draws_with_equipment, equipment_quality = join_winning_draws_with_equipment(df, equipment_df)
+else:
+    draws_with_equipment, equipment_quality = pd.DataFrame(), pd.DataFrame()
+
 PAGE_LABELS = {
     "Inicio (Forecast)": "1. Resumen y combinaciones",
     "Validacion (Backtest)": "2. Validación histórica",
@@ -1180,8 +1281,9 @@ PAGE_LABELS = {
     "Diagnosticos": "6. Diagnósticos avanzados",
     "Perfil y Calidad": "7. Calidad de datos",
     "Rolling": "8. Evolución temporal",
-    "Simulador Fisico": "9. Laboratorio experimental",
-    "Datos y Exportes": "10. Datos y descargas",
+    "Equipos y Pre-tests": "9. Equipos y pre-tests",
+    "Simulador Fisico": "10. Laboratorio experimental",
+    "Datos y Exportes": "11. Datos y descargas",
 }
 st.sidebar.header("Secciones")
 page = st.sidebar.radio(
@@ -1256,6 +1358,12 @@ filtered = filtered.reset_index(drop=True)
 if filtered.empty:
     st.warning("No rows match the current filters.")
     st.stop()
+
+if not equipment_df.empty:
+    selected_draw_dates = set(filtered["draw_date"])
+    equipment_filtered = equipment_df[equipment_df["draw_date"].isin(selected_draw_dates)].reset_index(drop=True)
+else:
+    equipment_filtered = pd.DataFrame()
 
 white_exp = add_significance_columns(mixed_expected_white(filtered))
 pb_exp = add_significance_columns(mixed_expected_powerball(filtered))
@@ -2006,71 +2114,372 @@ elif page == "Estructura y Combinaciones":
         fig.update_layout(height=430, title="Pair co-occurrence heatmap (top 20)")
         st.plotly_chart(fig, width="stretch")
 
-elif page == "Simulador Fisico":
-    st.subheader("Simulador Fisico")
-    st.caption("Sensibilidad estadistica: uniforme vs sesgo por peso/desgaste.")
-    weight_upload = st.file_uploader(
-        "Optional measured weights CSV (columns: number,weight)",
-        type=["csv"],
-        key="weights_upload_nav",
+elif page == "Equipos y Pre-tests":
+    st.subheader("Equipos y pre-tests")
+    st.markdown(
+        "<div class='accuracy-note'><b>Uso correcto:</b> estos datos permiten buscar desviaciones por máquina "
+        "y set, pero normalmente se publican después del sorteo. Por eso su validación es retrospectiva y no "
+        "modifica el POP del próximo sorteo.</div>",
+        unsafe_allow_html=True,
     )
-    measured_weights_df = None
-    if weight_upload is not None:
-        try:
-            measured_weights_df, missing_weight_rows = parse_weights_csv_bytes(
-                weight_upload.getvalue(), int(filtered["white_pool_max"].max())
+    if equipment_df.empty:
+        st.info("No fue posible cargar el reporte de pre-tests ni su copia local.")
+    else:
+        quality_map = equipment_quality.set_index("metric")["value"].to_dict()
+        eq1, eq2, eq3, eq4 = st.columns(4)
+        eq1.metric("Fuente", equipment_source_label)
+        eq2.metric("Última fecha de equipos", str(pd.Timestamp(equipment_df["draw_date"].max()).date()))
+        eq3.metric("Cobertura del CSV", f"{float(quality_map.get('coverage_pct', 0)):.1f}%")
+        mismatch_total = int(quality_map.get("white_number_mismatches", 0)) + int(
+            quality_map.get("powerball_mismatches", 0)
+        )
+        eq4.metric("Discordancias", f"{mismatch_total:,}")
+        st.caption(
+            "La fecha del reporte de equipos puede quedar detrás del CSV ganador por el tiempo de publicación del PDF."
+        )
+        if pd.Timestamp(equipment_df["draw_date"].max()) < pd.Timestamp(df["draw_date"].max()):
+            st.info(
+                f"El CSV ganador llega a {df['draw_date'].max().date()}, mientras el reporte de equipos llega a "
+                f"{equipment_df['draw_date'].max().date()}. Los sorteos pendientes quedan sin equipo, no se imputan."
             )
-            st.success(
-                f"Measured weights loaded for {len(measured_weights_df) - missing_weight_rows} numbers; "
-                f"imputed {missing_weight_rows} missing numbers."
+        mismatch_rows = draws_with_equipment[
+            draws_with_equipment["equipment_available"]
+            & (~draws_with_equipment["white_numbers_match"] | ~draws_with_equipment["powerball_matches"])
+        ]
+        if not mismatch_rows.empty:
+            with st.expander("Auditar discordancias entre las dos fuentes"):
+                st.caption(
+                    "Se conservan como discrepancias de fuente y no se corrigen automáticamente con valores inventados."
+                )
+                st.dataframe(
+                    mismatch_rows[
+                        [
+                            "draw_date",
+                            *WHITE_COLS,
+                            "powerball",
+                            "white_1",
+                            "white_2",
+                            "white_3",
+                            "white_4",
+                            "white_5",
+                            "equipment_powerball",
+                            "white_numbers_match",
+                            "powerball_matches",
+                        ]
+                    ],
+                    width="stretch",
+                    hide_index=True,
+                )
+
+        usage = equipment_usage_summary(equipment_filtered)
+        if usage.empty:
+            st.info("No hay filas de equipos para el rango filtrado.")
+        else:
+            st.markdown("### Uso de máquinas y sets")
+            usage_type = st.selectbox(
+                "Equipo a visualizar",
+                options=usage["equipment_type"].drop_duplicates().tolist(),
+                key="equipment_usage_type",
             )
-        except ValueError as exc:
-            st.warning(f"Weights file ignored: {exc}")
+            usage_view = usage[usage["equipment_type"].eq(usage_type)].sort_values("equipment_id")
+            usage_view["equipment_id"] = usage_view["equipment_id"].astype(int).astype(str)
+            fig = px.bar(
+                usage_view,
+                x="equipment_id",
+                y="draws",
+                hover_data=["first_draw", "last_draw"],
+                title=f"Sorteos por {usage_type.lower()}",
+            )
+            fig.update_layout(height=340, xaxis_title="Identificador", yaxis_title="Sorteos")
+            st.plotly_chart(fig, width="stretch")
+
+            st.markdown("### Desviaciones observadas por equipo")
+            dev_a, dev_b, dev_c = st.columns(3)
+            with dev_a:
+                deviation_ball_type = st.radio(
+                    "Campo",
+                    options=["White", "Powerball"],
+                    horizontal=True,
+                    key="equipment_deviation_ball_type",
+                )
+            if deviation_ball_type == "White":
+                group_options = {
+                    "Máquina white": "white_machine_id",
+                    "Set white": "white_ball_set_id",
+                }
+                internal_ball_type = "white"
+            else:
+                group_options = {
+                    "Máquina Powerball": "powerball_machine_id",
+                    "Set Powerball": "powerball_ball_set_id",
+                }
+                internal_ball_type = "powerball"
+            with dev_b:
+                deviation_group_label = st.selectbox(
+                    "Agrupar por",
+                    options=list(group_options),
+                    key="equipment_deviation_group",
+                )
+            with dev_c:
+                min_equipment_draws = st.slider(
+                    "Mínimo de sorteos por equipo",
+                    min_value=10,
+                    max_value=100,
+                    value=30,
+                    step=5,
+                    key="equipment_min_draws",
+                )
+            deviation = equipment_number_deviation(
+                equipment_filtered,
+                ball_type=internal_ball_type,
+                group_column=group_options[deviation_group_label],
+                min_draws=int(min_equipment_draws),
+            )
+            if deviation.empty:
+                st.info("Ningún equipo alcanza el mínimo de sorteos dentro del filtro actual.")
+            else:
+                equipment_ids = sorted(deviation["equipment_id"].astype(int).unique().tolist())
+                selected_equipment_id = st.selectbox(
+                    "Identificador a inspeccionar",
+                    options=equipment_ids,
+                    key="equipment_deviation_id",
+                )
+                deviation_view = deviation[deviation["equipment_id"].eq(selected_equipment_id)].copy()
+                sig_count = int(deviation_view["is_fdr_5pct"].sum())
+                st.metric("Números significativos después de FDR", sig_count)
+                fig = px.bar(
+                    deviation_view.sort_values("number"),
+                    x="number",
+                    y="z_score",
+                    color="is_fdr_5pct",
+                    title=f"Desviación por número: {deviation_group_label} {selected_equipment_id}",
+                    hover_data={"observed": True, "expected": ":.2f", "q_value_fdr": ":.4f"},
+                )
+                fig.add_hline(y=0, line_width=1, line_color="#4b5563")
+                fig.update_layout(height=360, yaxis_title="z-score")
+                st.plotly_chart(fig, width="stretch")
+                deviation_display = deviation_view.sort_values("z_score", ascending=False)[
+                    ["number", "observed", "expected", "z_score", "q_value_fdr", "is_fdr_5pct"]
+                ].copy()
+                deviation_display["number"] = deviation_display["number"].astype(int)
+                deviation_display["observed"] = deviation_display["observed"].astype(int)
+                deviation_display[["expected", "z_score", "q_value_fdr"]] = deviation_display[
+                    ["expected", "z_score", "q_value_fdr"]
+                ].round(4)
+                st.dataframe(deviation_display, width="stretch", hide_index=True)
+
+        st.markdown("### Pre-tests frente al sorteo oficial")
+        comparison = cached_pretest_comparison(equipment_filtered)
+        if comparison.empty:
+            st.info("No hay fechas con pre-tests y sorteo oficial dentro del filtro.")
+        else:
+            pc1, pc2, pc3 = st.columns(3)
+            pc1.metric("Fechas comparables", f"{len(comparison):,}")
+            pc2.metric(
+                "White vistos antes: observado",
+                f"{comparison['white_draw_numbers_seen_in_pretests'].mean():.2f}",
+            )
+            pc3.metric("White vistos antes: esperado", f"{comparison['white_expected_seen'].mean():.2f}")
+            overlap_distribution = (
+                comparison["white_draw_numbers_seen_in_pretests"]
+                .value_counts()
+                .sort_index()
+                .rename_axis("números_del_draw_vistos_en_pretests")
+                .reset_index(name="sorteos")
+            )
+            fig = px.bar(
+                overlap_distribution,
+                x="números_del_draw_vistos_en_pretests",
+                y="sorteos",
+                title="Coincidencias entre pre-tests y draw",
+            )
+            fig.update_layout(height=330)
+            st.plotly_chart(fig, width="stretch")
+            with st.expander("Ver comparaciones recientes"):
+                st.dataframe(comparison.tail(30).sort_values("draw_date", ascending=False), width="stretch", hide_index=True)
+
+        st.markdown("### Validación walk-forward de máquina + set")
+        st.caption(
+            "Usa la matriz actual completa. Para cada sorteo estima tasas con datos anteriores solamente y las "
+            "suaviza hacia el uniforme con un prior de 100 sorteos. Menor Brier es mejor."
+        )
+        equipment_detail, equipment_summary, equipment_yearly = cached_equipment_backtest(equipment_df)
+        if equipment_summary.empty:
+            st.info("No hay suficientes sorteos para validar la señal de equipos.")
+        else:
+            summary_display = equipment_summary.copy()
+            summary_display[
+                [
+                    "uniform_brier",
+                    "equipment_brier",
+                    "improvement",
+                    "improvement_ci_low",
+                    "improvement_ci_high",
+                ]
+            ] = summary_display[
+                [
+                    "uniform_brier",
+                    "equipment_brier",
+                    "improvement",
+                    "improvement_ci_low",
+                    "improvement_ci_high",
+                ]
+            ].round(7)
+            summary_display["model_win_rate"] = summary_display["model_win_rate"].map("{:.1%}".format)
+            st.dataframe(summary_display, width="stretch", hide_index=True)
+            equipment_yearly_chart = equipment_yearly.melt(
+                id_vars=["year"],
+                value_vars=["white_improvement", "pb_improvement"],
+                var_name="campo",
+                value_name="mejora_brier",
+            )
+            fig = px.bar(
+                equipment_yearly_chart,
+                x="year",
+                y="mejora_brier",
+                color="campo",
+                barmode="group",
+                title="Mejora anual frente al uniforme",
+            )
+            fig.add_hline(y=0, line_width=1, line_color="#4b5563")
+            fig.update_layout(height=360, yaxis_title="Uniforme - equipo")
+            st.plotly_chart(fig, width="stretch")
+            with st.expander("Ver backtest de equipos sorteo por sorteo"):
+                st.dataframe(equipment_detail.tail(250), width="stretch", hide_index=True)
+                st.download_button(
+                    "Descargar backtest de equipos",
+                    equipment_detail.to_csv(index=False).encode("utf-8"),
+                    file_name="powerball_equipment_backtest.csv",
+                    mime="text/csv",
+                )
+
+elif page == "Simulador Fisico":
+    st.subheader("Laboratorio físico")
+    st.markdown(
+        "<div class='accuracy-note'><b>No es forecast:</b> este laboratorio responde qué ocurriría bajo una "
+        "diferencia de masa elegida o medida. Sin pesos por número, el resultado permanece uniforme y no entra "
+        "en el POP.</div>",
+        unsafe_allow_html=True,
+    )
     sim_mode = st.radio(
-        "Simulation mode",
-        options=["Uniform", "Weight bias", "Weight + wear"],
+        "Fuente del escenario",
+        options=["Uniforme", "Escenario hipotético", "CSV de pesos medidos"],
         horizontal=True,
         key="sim_mode_nav",
     )
-    include_weight = sim_mode in {"Weight bias", "Weight + wear"}
-    include_wear = sim_mode == "Weight + wear"
+    measured_weights_df = None
+    max_sim_number = int(white_exp["number"].max())
     beta = 0.0
-    gamma = 0.0
-    if include_weight:
-        beta = st.slider("Weight bias intensity (beta)", min_value=-0.30, max_value=0.30, value=0.05, step=0.01, key="beta_nav")
-    if include_wear:
-        gamma = st.slider("Wear intensity (gamma)", min_value=-0.30, max_value=0.30, value=0.03, step=0.01, key="gamma_nav")
+    if sim_mode == "Escenario hipotético":
+        scenario_numbers = st.multiselect(
+            "Bolas afectadas en el escenario",
+            options=list(range(1, max_sim_number + 1)),
+            default=[1],
+            key="physical_scenario_numbers",
+        )
+        scenario_direction = st.radio(
+            "Diferencia de masa",
+            options=["Más ligera", "Más pesada"],
+            horizontal=True,
+            key="physical_scenario_direction",
+        )
+        scenario_delta = st.slider(
+            "Diferencia respecto a 80 g (%)",
+            min_value=0.10,
+            max_value=1.00,
+            value=0.375,
+            step=0.025,
+            key="physical_scenario_delta",
+        )
+        signed_delta = -float(scenario_delta) if scenario_direction == "Más ligera" else float(scenario_delta)
+        measured_weights_df = build_hypothetical_weight_table(
+            max_number=max_sim_number,
+            target_numbers=[int(number) for number in scenario_numbers],
+            nominal_weight_g=80.0,
+            relative_delta_pct=signed_delta,
+        )
+        beta = st.slider(
+            "Sensibilidad asumida (log-odds por 1% de masa)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.10,
+            step=0.01,
+            key="physical_beta",
+        )
+    elif sim_mode == "CSV de pesos medidos":
+        weight_upload = st.file_uploader(
+            "CSV medido: columnas number,weight",
+            type=["csv"],
+            key="weights_upload_nav",
+        )
+        if weight_upload is not None:
+            try:
+                measured_weights_df, missing_weight_rows = parse_weights_csv_bytes(
+                    weight_upload.getvalue(), max_sim_number
+                )
+                st.success(
+                    f"Pesos válidos: {len(measured_weights_df) - missing_weight_rows}; "
+                    f"valores imputados con la media: {missing_weight_rows}."
+                )
+            except ValueError as exc:
+                st.warning(f"El archivo de pesos fue ignorado: {exc}")
+        beta = st.slider(
+            "Sensibilidad asumida (log-odds por 1% de masa)",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.10,
+            step=0.01,
+            key="physical_beta_measured",
+        )
+    include_weight = sim_mode != "Uniforme" and measured_weights_df is not None
     sim_df, sim_metrics = physical_bias_projection(
         white_exp,
         include_weight=include_weight,
-        include_wear=include_wear,
-        beta=beta,
-        gamma=gamma,
+        include_wear=False,
+        beta=float(beta),
+        gamma=0.0,
         measured_weights=measured_weights_df,
     )
+    st.caption(
+        "Fórmula de estrés: log(p ajustada) = log(p uniforme) - sensibilidad × diferencia de masa (%). "
+        "El coeficiente es hipotético; no se ha medido para la máquina Halogen de Powerball."
+    )
     sim_m1, sim_m2, sim_m3, sim_m4 = st.columns(4)
-    sim_m1.metric("Weight source", sim_metrics.get("weight_source", "N/A"))
-    sim_m2.metric("Chi-square (uniform)", f"{sim_metrics.get('chi2_uniform', np.nan):.2f}")
-    sim_m3.metric("Chi-square (simulated)", f"{sim_metrics.get('chi2_adjusted', np.nan):.2f}")
-    sim_m4.metric("Delta χ²", f"{sim_metrics.get('chi2_delta', np.nan):+.2f}")
+    sim_m1.metric("Fuente de masa", sim_metrics.get("weight_source", "N/A"))
+    sim_m2.metric("χ² uniforme", f"{sim_metrics.get('chi2_uniform', np.nan):.2f}")
+    sim_m3.metric("χ² escenario", f"{sim_metrics.get('chi2_adjusted', np.nan):.2f}")
+    sim_m4.metric("Cambio de ajuste χ²", f"{sim_metrics.get('chi2_delta', np.nan):+.2f}")
     col_sim_a, col_sim_b = st.columns(2)
     with col_sim_a:
         sim_plot = sim_df.sort_values("number")
         fig = go.Figure()
-        fig.add_scatter(x=sim_plot["number"], y=sim_plot["baseline_prob"], name="Uniform baseline", mode="lines")
-        fig.add_scatter(x=sim_plot["number"], y=sim_plot["adjusted_prob"], name="Simulated", mode="lines")
-        fig.update_layout(height=320, title="Probability curve: uniform vs simulated")
+        fig.add_scatter(x=sim_plot["number"], y=sim_plot["baseline_prob"], name="Uniforme", mode="lines")
+        fig.add_scatter(x=sim_plot["number"], y=sim_plot["adjusted_prob"], name="Escenario", mode="lines")
+        fig.update_layout(height=320, title="Uniforme frente al escenario", yaxis_title="Probabilidad relativa")
         st.plotly_chart(fig, width="stretch")
     with col_sim_b:
-        top_lift = sim_df.sort_values("prob_lift_pct", ascending=False).head(15)
-        fig = px.bar(top_lift, x="number", y="prob_lift_pct", title="Top probability lift (%)")
-        fig.update_layout(height=320, yaxis_title="% lift vs uniform")
+        top_lift = sim_df.reindex(sim_df["prob_lift_pct"].abs().sort_values(ascending=False).index).head(15)
+        fig = px.bar(top_lift, x="number", y="prob_lift_pct", title="Mayor cambio absoluto (%)")
+        fig.update_layout(height=320, yaxis_title="% frente al uniforme")
         st.plotly_chart(fig, width="stretch")
-    st.dataframe(
-        sim_df[["number", "observed", "expected", "adjusted_expected", "prob_lift_pct", "expected_delta"]].head(20),
-        width="stretch",
-        hide_index=True,
+    physical_display = sim_df[
+        [
+            "number",
+            "weight_delta_pct",
+            "observed",
+            "expected",
+            "adjusted_expected",
+            "prob_lift_pct",
+            "expected_delta",
+        ]
+    ].copy()
+    physical_display["number"] = physical_display["number"].astype(int)
+    physical_display[["weight_delta_pct", "expected", "adjusted_expected", "prob_lift_pct", "expected_delta"]] = (
+        physical_display[
+            ["weight_delta_pct", "expected", "adjusted_expected", "prob_lift_pct", "expected_delta"]
+        ].round(4)
     )
+    st.dataframe(physical_display, width="stretch", hide_index=True)
     default_sim_df = sim_df
 
 elif page == "Rolling":
@@ -2114,6 +2523,15 @@ else:
     )
     csv_export = filtered[["draw_date", *WHITE_COLS, "powerball", "power_play", "weekday", "era", "year"]].to_csv(index=False).encode("utf-8")
     st.download_button("Download filtered dataset", csv_export, file_name="powerball_filtered.csv", mime="text/csv")
+    equipment_export_detail = pd.DataFrame()
+    if not equipment_df.empty:
+        equipment_export_detail, _, _ = cached_equipment_backtest(equipment_df)
+        st.download_button(
+            "Descargar equipos y pre-tests normalizados",
+            equipment_filtered.to_csv(index=False).encode("utf-8"),
+            file_name="powerball_equipment_pretests.csv",
+            mime="text/csv",
+        )
     if OPENPYXL_OK:
         excel_bytes = build_excel_export(
             filtered=filtered,
@@ -2135,6 +2553,9 @@ else:
             sim_pair_freq=sim_pair_freq,
             sim_triplet_freq=sim_triplet_freq,
             sim_df=default_sim_df.sort_values("number").reset_index(drop=True),
+            equipment_rows=equipment_filtered,
+            equipment_quality=equipment_quality,
+            equipment_backtest=equipment_export_detail,
         )
         st.download_button(
             "Download full analysis (Excel)",

@@ -162,13 +162,14 @@ This uploaded file supports a strong **statistical exploration system**, not a r
 ## 9. Physical-bias module policy
 The dashboard includes a **Physical Bias Simulator** only as a controlled sensitivity module:
 - `Uniform` baseline (era-aware expected values)
-- `Weight bias` (hypothetical or measured `number,weight`)
-- `Weight + wear` (adds a wear proxy term)
+- An explicit target-ball stress scenario using an approximate nominal mass of 80 g
+- Measured `number,weight` values when supplied by the user
 
 This module is explicitly exploratory:
 - It does **not** claim predictive power.
 - It is meant to compare how rankings would change under small hypothetical perturbations.
-- If no measured weights are uploaded, the app uses a transparent hypothetical signal and labels it as such.
+- It does not infer physical weight from the ball number or historical frequency.
+- If no measured weights or explicit scenario are supplied, the result remains uniform.
 
 ## 10. Accuracy v3 forecast policy
 The production forecast treats the five white balls as one unordered, fixed-size subset. Given positive
@@ -191,3 +192,24 @@ evidence label from a bootstrap interval of Brier improvement:
 
 The dashboard also reports moving-block bootstrap intervals for next-draw POP. These ranges describe model
 uncertainty; they do not alter the official game odds.
+
+## 11. Equipment and pre-test evidence
+The official MUSL pre-test report is parsed into a normalized table containing draw order, machine IDs,
+ball-set IDs, pre-tests, official draws, and post-tests. The dashboard joins official draw rows to the Texas
+winning-number CSV by date and verifies both the unordered white set and Powerball value.
+
+For equipment-conditioned probabilities, the walk-forward estimator uses only rows before each target draw.
+Machine-only and set-only rates are independently shrunk toward the uniform model with a 100-draw prior and
+then averaged. This avoids treating small equipment groups as strong evidence.
+
+Result on the current 5/69 + PB26 era through the available equipment report:
+- White equipment Brier: `0.067288` versus uniform `0.067213`.
+- Powerball equipment Brier: `0.037027` versus uniform `0.036982`.
+- Both evidence labels are `Sin mejora` because their mean improvements are negative.
+- No white machine-number comparison survives 5% FDR in the current analysis.
+- Mean white overlap between pre-tests and the official draw is approximately `1.398`, versus an expected
+  `1.395` under independence and the applicable matrix.
+
+Therefore machine/set and pre-test information remains a retrospective integrity diagnostic. It is not part
+of the next-draw POP unless a future preregistered out-of-sample test produces stable positive evidence and
+the equipment selection is available before the relevant ticket-sales cutoff.
