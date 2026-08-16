@@ -61,6 +61,10 @@ st.markdown(
         padding: 14px 16px;
         box-shadow: 0 8px 24px rgba(24, 39, 75, 0.05);
     }
+    [data-testid="stMetricValue"] {
+        font-size: clamp(1.35rem, 1.8vw, 2.2rem) !important;
+        line-height: 1.15 !important;
+    }
     [data-testid="stSidebar"] {
         background: #f4f7fb;
         color: #182230;
@@ -1559,11 +1563,21 @@ if not pb_forecast.empty:
         pb_forecast["pop_next_draw"] - pb_forecast["uniform_pop_next_draw"]
     ) * 100
 
+source_metric_labels = {
+    "Texas Lottery (automática)": "Texas Lottery",
+    "Subir mi CSV": "CSV cargado",
+    "Copia local incluida": "Copia local",
+    "Copia local de respaldo": "Respaldo local",
+}
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Fuente activa", data_source_label)
+c1.metric("Fuente activa", source_metric_labels.get(data_source_label, data_source_label), help=data_source_label)
 c2.metric("Último sorteo disponible", str(df["draw_date"].max().date()))
-c3.metric("Sorteos para forecast", f"{len(forecast_source):,}")
-c4.metric("Sorteos en la vista", f"{len(filtered):,}")
+c3.metric(
+    "Histórico de era actual",
+    f"{len(forecast_source):,}",
+    help="Sorteos con la matriz vigente 5/69 + PB26 usados por el forecast.",
+)
+c4.metric("Histórico filtrado", f"{len(filtered):,}", help="Sorteos visibles según los filtros laterales.")
 
 guide_df = build_navigation_guide()
 default_sim_df, default_sim_metrics = physical_bias_projection(
@@ -1941,14 +1955,28 @@ elif page == "Plan de Juego":
             key="play_plan_input_mode",
         )
     with input_b:
-        ticket_cost_input = st.number_input(
-            "Costo total por ticket ($)",
-            min_value=0.01,
-            max_value=20.0,
-            value=2.0,
-            step=0.5,
-            key="play_plan_ticket_cost",
+        play_type = st.selectbox(
+            "Tipo de jugada",
+            options=["Base ($2)", "Power Play ($3)", "Personalizado"],
+            key="play_plan_ticket_type",
+            help="En Texas, Powerball cuesta $2; Power Play agrega $1 por jugada.",
         )
+        if play_type == "Base ($2)":
+            ticket_cost_input = 2.0
+        elif play_type == "Power Play ($3)":
+            ticket_cost_input = 3.0
+        else:
+            ticket_cost_input = float(
+                st.number_input(
+                    "Costo personalizado por ticket ($)",
+                    min_value=0.01,
+                    max_value=20.0,
+                    value=2.0,
+                    step=0.5,
+                    key="play_plan_custom_ticket_cost",
+                )
+            )
+        st.caption(f"Costo aplicado: ${ticket_cost_input:.2f} por ticket.")
     with input_c:
         plan_draws_per_week = st.slider(
             "Draws por semana",
@@ -1990,8 +2018,9 @@ elif page == "Plan de Juego":
             )
         )
         plan_tickets = min(50, int(plan_budget_per_draw // float(ticket_cost_input)))
+        ticket_text = "ticket completo" if plan_tickets == 1 else "tickets completos"
         st.caption(
-            f"El presupuesto permite {plan_tickets} tickets completos; el portafolio se limita a 50 por draw."
+            f"El presupuesto permite {plan_tickets} {ticket_text}; el portafolio se limita a 50 por draw."
         )
 
     play_plan = calculate_play_plan(
@@ -2038,10 +2067,13 @@ elif page == "Plan de Juego":
     )
     st.caption(
         "Supuestos: tickets completos distintos dentro de cada draw, matriz constante y sorteos independientes. "
-        "El proyecto no calcula aquí premios menores ni retorno esperado. El costo es editable; $2 es la referencia "
-        "actual sin extras."
+        "El proyecto no calcula aquí premios menores ni retorno esperado. En Texas la jugada base cuesta $2 y "
+        "Power Play agrega $1; Power Play no cambia la probabilidad del jackpot."
     )
-    st.markdown("[Verificar precio vigente del ticket](https://www.powerball.com/faqs?hl=en-US)")
+    st.markdown(
+        "[Verificar precio vigente en Texas Lottery]"
+        "(https://www.texaslottery.com/export/sites/lottery/Games/Powerball/index.html)"
+    )
     if plan_tickets == 0:
         st.success("Plan financiero óptimo: cero costo y cero exposición.")
     elif float(play_plan["cost_per_year"]) > 1560:

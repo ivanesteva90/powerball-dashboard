@@ -77,7 +77,8 @@ where:
   - Equipment signals remain outside POP unless future out-of-sample evidence supports them
 - Play-plan section:
   - Ticket-count or per-draw budget input
-  - Editable ticket cost, draws per week, and 1-30 year horizon
+  - Explicit Texas pricing: base play ($2), Power Play ($3), or custom cost
+  - Editable draws per week and 1-30 year horizon
   - Exact per-draw, annual, and cumulative jackpot coverage
   - Per-draw, weekly, annual, and horizon cost
   - Side-by-side scenarios for 0, 1, 3, 5, 10, 25, and 50 tickets
