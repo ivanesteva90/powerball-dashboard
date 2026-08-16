@@ -13,6 +13,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from powerball_core import (
+    build_powerball_forecast,
+    build_white_forecast,
+    current_matrix_draws,
+    walk_forward_backtest,
+)
+
 try:
     from scipy.stats import chi2, norm
     SCIPY_OK = True
@@ -27,6 +34,36 @@ except Exception:
 
 st.set_page_config(page_title="Powerball Analytics Dashboard", layout="wide")
 
+st.markdown(
+    """
+    <style>
+    .block-container {padding-top: 1.7rem; padding-bottom: 3rem; max-width: 1500px;}
+    [data-testid="stMetric"] {
+        background: linear-gradient(145deg, #ffffff 0%, #f4f7fb 100%);
+        border: 1px solid #dce3ec;
+        border-radius: 14px;
+        padding: 14px 16px;
+        box-shadow: 0 8px 24px rgba(24, 39, 75, 0.05);
+    }
+    [data-testid="stSidebar"] {background: #f4f7fb;}
+    .accuracy-note {
+        border-left: 4px solid #e63946;
+        background: #fff5f5;
+        padding: 0.8rem 1rem;
+        border-radius: 0 10px 10px 0;
+        margin: 0.5rem 0 1.1rem 0;
+    }
+    .data-ok {
+        border-left: 4px solid #16855b;
+        background: #f0fbf6;
+        padding: 0.8rem 1rem;
+        border-radius: 0 10px 10px 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 WHITE_COLS = ["num1", "num2", "num3", "num4", "num5"]
 TEXAS_POWERBALL_CSV_URL = "https://www.texaslottery.com/export/sites/lottery/Games/Powerball/Winning_Numbers/powerball.csv"
 POWERBALL_DRAW_WEEKDAYS = {0, 2, 5}  # Monday, Wednesday, Saturday (Texas Lottery schedule)
@@ -40,7 +77,7 @@ def infer_matrix(draw_date: pd.Timestamp) -> tuple[int, int, str]:
         return 59, 39, "2010-2011 | 5/59 + PB39"
     if draw_date <= pd.Timestamp("2015-10-03"):
         return 59, 35, "2012-2015 | 5/59 + PB35"
-    return 69, 26, "2015-2026 | 5/69 + PB26"
+    return 69, 26, "2015-presente | 5/69 + PB26"
 
 
 @st.cache_data(show_spinner=False)
@@ -261,12 +298,16 @@ def draw_quality_report(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         lambda r: (int(r["powerball"]) < 1) or (int(r["powerball"]) > int(r["powerball_pool_max"])),
         axis=1,
     )
-    detail["any_issue"] = detail[["duplicate_white_in_draw", "white_out_of_range", "powerball_out_of_range"]].any(axis=1)
+    detail["duplicate_draw_date"] = detail["draw_date"].duplicated(keep=False)
+    detail["any_issue"] = detail[
+        ["duplicate_white_in_draw", "white_out_of_range", "powerball_out_of_range", "duplicate_draw_date"]
+    ].any(axis=1)
 
     total = len(detail)
     summary = pd.DataFrame(
         [
             ("Duplicate white numbers in same draw", int(detail["duplicate_white_in_draw"].sum())),
+            ("Duplicate draw date", int(detail["duplicate_draw_date"].sum())),
             ("White ball outside era range", int(detail["white_out_of_range"].sum())),
             ("Powerball outside era range", int(detail["powerball_out_of_range"].sum())),
             ("Any issue", int(detail["any_issue"].sum())),
@@ -320,6 +361,11 @@ def download_texas_powerball_csv(url: str = TEXAS_POWERBALL_CSV_URL, timeout_sec
         return response.read()
 
 
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_official_powerball() -> pd.DataFrame:
+    return parse_powerball_csv_bytes(download_texas_powerball_csv())
+
+
 def overdue_white(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=["number", "draws_since_seen", "last_seen"])
@@ -371,9 +417,22 @@ def pair_frequency(df: pd.DataFrame, top_n: int = 20) -> pd.DataFrame:
     for nums in df["white_sorted"]:
         for pair in combinations(nums, 2):
             counter[pair] += 1
-    return pd.DataFrame(
-        [(f"{a}-{b}", c) for (a, b), c in counter.most_common(top_n)], columns=["pair", "count"]
-    )
+    pool_counts = df["white_pool_max"].value_counts().to_dict()
+    rows = []
+    for (a, b), observed in counter.items():
+        expected = 0.0
+        variance = 0.0
+        for pool_size, draw_count in pool_counts.items():
+            if int(pool_size) < max(a, b):
+                continue
+            probability = 20 / (int(pool_size) * (int(pool_size) - 1))
+            expected += draw_count * probability
+            variance += draw_count * probability * (1 - probability)
+        z_score = (observed - expected) / np.sqrt(variance) if variance > 0 else np.nan
+        lift = (observed / expected - 1) * 100 if expected > 0 else np.nan
+        rows.append((f"{a}-{b}", observed, expected, lift, z_score))
+    result = pd.DataFrame(rows, columns=["pair", "count", "expected", "lift_vs_expected_pct", "z_score"])
+    return result.sort_values(["z_score", "count"], ascending=[False, False]).head(top_n).reset_index(drop=True)
 
 
 def triplet_frequency(df: pd.DataFrame, top_n: int = 15) -> pd.DataFrame:
@@ -381,9 +440,23 @@ def triplet_frequency(df: pd.DataFrame, top_n: int = 15) -> pd.DataFrame:
     for nums in df["white_sorted"]:
         for tri in combinations(nums, 3):
             counter[tri] += 1
-    return pd.DataFrame(
-        [(f"{a}-{b}-{c}", c) for (a, b, c), c in counter.most_common(top_n)], columns=["triplet", "count"]
-    )
+    pool_counts = df["white_pool_max"].value_counts().to_dict()
+    rows = []
+    for (a, b, c), observed in counter.items():
+        expected = 0.0
+        variance = 0.0
+        for pool_size, draw_count in pool_counts.items():
+            pool_size = int(pool_size)
+            if pool_size < max(a, b, c):
+                continue
+            probability = 60 / (pool_size * (pool_size - 1) * (pool_size - 2))
+            expected += draw_count * probability
+            variance += draw_count * probability * (1 - probability)
+        z_score = (observed - expected) / np.sqrt(variance) if variance > 0 else np.nan
+        lift = (observed / expected - 1) * 100 if expected > 0 else np.nan
+        rows.append((f"{a}-{b}-{c}", observed, expected, lift, z_score))
+    result = pd.DataFrame(rows, columns=["triplet", "count", "expected", "lift_vs_expected_pct", "z_score"])
+    return result.sort_values(["z_score", "count"], ascending=[False, False]).head(top_n).reset_index(drop=True)
 
 
 def ticket_frequency(df: pd.DataFrame) -> pd.DataFrame:
@@ -628,130 +701,31 @@ def statistical_forecast_white(
     filtered: pd.DataFrame,
     white_exp: pd.DataFrame,
     white_score: pd.DataFrame,
-    strength: float = 0.35,
+    strength: float = 0.025,
 ) -> pd.DataFrame:
-    if filtered.empty or white_exp.empty:
-        return pd.DataFrame()
-
-    active_pool = int(filtered.iloc[-1]["white_pool_max"])
-    active_df = filtered[filtered["white_pool_max"] == active_pool].copy()
-    if active_df.empty:
-        active_df = filtered.copy()
-
-    base = white_exp[white_exp["number"] <= active_pool].copy()
-    draws_active = len(active_df)
-    prior_rate = 5 / active_pool
-    prior_strength = 20.0
-
-    counts_active = white_counts(active_df).reindex(range(1, active_pool + 1), fill_value=0).astype(float)
-    long_rate = (counts_active + prior_strength * prior_rate) / (draws_active + prior_strength)
-
-    recent_n = min(52, draws_active)
-    recent_df = active_df.tail(recent_n)
-    recent_counts = white_counts(recent_df).reindex(range(1, active_pool + 1), fill_value=0).astype(float)
-    recent_rate = (recent_counts + prior_strength * prior_rate) / (recent_n + prior_strength)
-
-    overdue_active = overdue_white(active_df).set_index("number")
-    gap = overdue_active.reindex(range(1, active_pool + 1))["draws_since_seen"].fillna(draws_active).to_numpy(dtype=float)
-    gap_std = gap.std(ddof=0) or 1.0
-    gap_z = (gap - gap.mean()) / gap_std
-
-    score_map = white_score.set_index("number")
-    score_signal = score_map.reindex(range(1, active_pool + 1))["exploration_score"].fillna(0).to_numpy(dtype=float)
-    recent_52_z = score_map.reindex(range(1, active_pool + 1))["recent_52_z"].fillna(0).to_numpy(dtype=float)
-    gap_z_from_score = score_map.reindex(range(1, active_pool + 1))["gap_z"].fillna(0).to_numpy(dtype=float)
-
-    long_z = (long_rate.to_numpy() - long_rate.to_numpy().mean()) / (long_rate.to_numpy().std(ddof=0) or 1.0)
-    recent_z = (recent_rate.to_numpy() - recent_rate.to_numpy().mean()) / (recent_rate.to_numpy().std(ddof=0) or 1.0)
-    score_z = (score_signal - score_signal.mean()) / (score_signal.std(ddof=0) or 1.0)
-    signal = 0.45 * long_z + 0.30 * recent_z + 0.15 * gap_z + 0.10 * score_z
-
-    baseline = np.repeat(1 / active_pool, len(base))
-    logits = np.log(baseline) + float(strength) * signal
-    draw_prob = _stable_softmax(logits)
-
-    base["observed_active_era"] = counts_active.to_numpy().astype(int)
-    base["long_rate_active"] = long_rate.to_numpy()
-    base["recent_rate_52"] = recent_rate.to_numpy()
-    base["draws_since_seen"] = gap.astype(int)
-    base["recent_52_z"] = recent_52_z
-    base["gap_z"] = gap_z_from_score
-    base["forecast_signal"] = signal
-    base["draw_prob"] = draw_prob
-    base["inclusion_prob_next_draw"] = np.clip(5 * base["draw_prob"], 0, 1)
-    base["lift_vs_uniform_pct"] = (base["draw_prob"] / (1 / active_pool) - 1) * 100
-    base = base.sort_values("inclusion_prob_next_draw", ascending=False).reset_index(drop=True)
-    base["rank"] = np.arange(1, len(base) + 1)
-    return base
+    del white_exp, white_score
+    result = build_white_forecast(filtered, strength=float(strength))
+    if not result.empty:
+        result["draw_prob"] = result["draw_weight"]
+        result["inclusion_prob_next_draw"] = np.nan
+        result["z_score"] = result["forecast_signal"]
+        result["recent_52_z"] = np.nan
+        result["gap_z"] = np.nan
+    return result
 
 
 def statistical_forecast_pb(
     filtered: pd.DataFrame,
     pb_exp: pd.DataFrame,
     pb_over: pd.DataFrame,
-    strength: float = 0.30,
+    strength: float = 0.025,
 ) -> pd.DataFrame:
-    if filtered.empty or pb_exp.empty:
-        return pd.DataFrame()
-
-    active_pool = int(filtered.iloc[-1]["powerball_pool_max"])
-    active_df = filtered[filtered["powerball_pool_max"] == active_pool].copy()
-    if active_df.empty:
-        active_df = filtered.copy()
-
-    base = pb_exp[pb_exp["number"] <= active_pool].copy()
-    draws_active = len(active_df)
-    prior_rate = 1 / active_pool
-    prior_strength = 20.0
-
-    counts_active = (
-        active_df["powerball"]
-        .astype(int)
-        .value_counts()
-        .sort_index()
-        .reindex(range(1, active_pool + 1), fill_value=0)
-        .astype(float)
-    )
-    long_rate = (counts_active + prior_strength * prior_rate) / (draws_active + prior_strength)
-
-    recent_n = min(52, draws_active)
-    recent_df = active_df.tail(recent_n)
-    recent_counts = (
-        recent_df["powerball"]
-        .astype(int)
-        .value_counts()
-        .sort_index()
-        .reindex(range(1, active_pool + 1), fill_value=0)
-        .astype(float)
-    )
-    recent_rate = (recent_counts + prior_strength * prior_rate) / (recent_n + prior_strength)
-
-    over = overdue_powerball(active_df)[["number", "draws_since_seen"]].copy()
-    base = base.merge(over, on="number", how="left")
-    base["draws_since_seen"] = base["draws_since_seen"].fillna(draws_active)
-
-    gap = base["draws_since_seen"].to_numpy(dtype=float)
-    gap_std = gap.std(ddof=0) or 1.0
-    gap_z = (gap - gap.mean()) / gap_std
-
-    long_z = (long_rate.to_numpy() - long_rate.to_numpy().mean()) / (long_rate.to_numpy().std(ddof=0) or 1.0)
-    recent_z = (recent_rate.to_numpy() - recent_rate.to_numpy().mean()) / (recent_rate.to_numpy().std(ddof=0) or 1.0)
-    z = base["z_score"].fillna(0).to_numpy(dtype=float)
-    signal = 0.45 * long_z + 0.30 * recent_z + 0.15 * z + 0.10 * gap_z
-
-    baseline = np.repeat(1 / active_pool, len(base))
-    logits = np.log(baseline) + float(strength) * signal
-    draw_prob = _stable_softmax(logits)
-
-    base["observed_active_era"] = counts_active.to_numpy().astype(int)
-    base["long_rate_active"] = long_rate.to_numpy()
-    base["recent_rate_52"] = recent_rate.to_numpy()
-    base["forecast_signal"] = signal
-    base["draw_prob"] = draw_prob
-    base["lift_vs_uniform_pct"] = (base["draw_prob"] / (1 / active_pool) - 1) * 100
-    base = base.sort_values("draw_prob", ascending=False).reset_index(drop=True)
-    base["rank"] = np.arange(1, len(base) + 1)
-    return base
+    del pb_exp, pb_over
+    result = build_powerball_forecast(filtered, strength=float(strength))
+    if not result.empty:
+        result["draw_prob"] = result["draw_weight"]
+        result["z_score"] = result["forecast_signal"]
+    return result
 
 
 def _minmax_scale(values: np.ndarray) -> np.ndarray:
@@ -764,16 +738,16 @@ def _minmax_scale(values: np.ndarray) -> np.ndarray:
     return (values - vmin) / (vmax - vmin)
 
 
-def _build_sim_count_df(counter: Counter, key_name: str) -> pd.DataFrame:
+def _build_sim_count_df(counter: Counter, key_name: str, n_samples: int) -> pd.DataFrame:
     if not counter:
-        return pd.DataFrame(columns=[key_name, "sim_count", "sim_rate"])
+        return pd.DataFrame(columns=[key_name, "sim_count", "appearance_rate"])
     rows = [(k, v) for k, v in counter.items()]
     df = pd.DataFrame(rows, columns=[key_name, "sim_count"]).sort_values("sim_count", ascending=False)
-    total = df["sim_count"].sum()
-    df["sim_rate"] = np.where(total > 0, df["sim_count"] / total, 0.0)
+    df["appearance_rate"] = np.where(n_samples > 0, df["sim_count"] / n_samples, 0.0)
     return df.reset_index(drop=True)
 
 
+@st.cache_data(show_spinner=False)
 def run_ticket_simulation_bundle(
     white_forecast: pd.DataFrame,
     pb_forecast: pd.DataFrame,
@@ -798,10 +772,10 @@ def run_ticket_simulation_bundle(
         )
         return {
             "tickets": empty_tickets,
-            "white_number_freq": pd.DataFrame(columns=["number", "sim_count", "sim_rate"]),
-            "powerball_freq": pd.DataFrame(columns=["number", "sim_count", "sim_rate"]),
-            "pair_freq": pd.DataFrame(columns=["pair", "sim_count", "sim_rate"]),
-            "triplet_freq": pd.DataFrame(columns=["triplet", "sim_count", "sim_rate"]),
+            "white_number_freq": pd.DataFrame(columns=["number", "sim_count", "appearance_rate"]),
+            "powerball_freq": pd.DataFrame(columns=["number", "sim_count", "appearance_rate"]),
+            "pair_freq": pd.DataFrame(columns=["pair", "sim_count", "appearance_rate"]),
+            "triplet_freq": pd.DataFrame(columns=["triplet", "sim_count", "appearance_rate"]),
         }
 
     rng = np.random.default_rng(int(seed))
@@ -834,8 +808,7 @@ def run_ticket_simulation_bundle(
             triplet_counter[t] += 1
 
     candidate_rows = []
-    candidate_pool = max(int(top_n) * 30, 300)
-    for (w, pb), cnt in ticket_counter.most_common(candidate_pool):
+    for (w, pb), cnt in ticket_counter.items():
         empirical_raw = float(np.mean([white_emp_map.get(n, 0.0) for n in w] + [pb_emp_map.get(pb, 0.0)]))
         stat_log = float(np.sum([np.log(max(white_draw_prob_map.get(n, 1e-12), 1e-12)) for n in w]) + np.log(max(pb_prob_map.get(pb, 1e-12), 1e-12)))
         candidate_rows.append(
@@ -861,6 +834,8 @@ def run_ticket_simulation_bundle(
     candidates["empirical_freq_score"] = _minmax_scale(candidates["empirical_raw"].to_numpy(dtype=float))
     candidates["statistical_weight_score"] = _minmax_scale(candidates["statistical_raw"].to_numpy(dtype=float))
     candidates["base_score"] = 0.45 * candidates["empirical_freq_score"] + 0.55 * candidates["statistical_weight_score"]
+    candidate_pool = max(int(top_n) * 200, 2000)
+    candidates = candidates.nlargest(min(candidate_pool, len(candidates)), "base_score").copy()
 
     selected_rows = []
     selected_tuples: list[tuple[tuple[int, ...], int]] = []
@@ -914,10 +889,14 @@ def run_ticket_simulation_bundle(
         ticket_df["powerball"] = ticket_df["powerball"].astype(int)
         ticket_df["sim_count"] = ticket_df["sim_count"].astype(int)
 
-    white_freq = _build_sim_count_df(white_counter, "number")
-    pb_freq = _build_sim_count_df(pb_counter, "number")
-    pair_freq = _build_sim_count_df(Counter({f"{a}-{b}": c for (a, b), c in pair_counter.items()}), "pair")
-    triplet_freq = _build_sim_count_df(Counter({f"{a}-{b}-{c}": c for (a, b, c), c in triplet_counter.items()}), "triplet")
+    white_freq = _build_sim_count_df(white_counter, "number", int(n_samples))
+    pb_freq = _build_sim_count_df(pb_counter, "number", int(n_samples))
+    pair_freq = _build_sim_count_df(
+        Counter({f"{a}-{b}": c for (a, b), c in pair_counter.items()}), "pair", int(n_samples)
+    )
+    triplet_freq = _build_sim_count_df(
+        Counter({f"{a}-{b}-{c}": c for (a, b, c), c in triplet_counter.items()}), "triplet", int(n_samples)
+    )
     if not white_freq.empty:
         white_freq["number"] = white_freq["number"].astype(int)
     if not pb_freq.empty:
@@ -1057,77 +1036,71 @@ def format_p(p):
     return f"{p:.4f}"
 
 
+@st.cache_data(show_spinner=False)
+def cached_walk_forward_backtest(df: pd.DataFrame):
+    return walk_forward_backtest(df)
+
+
 def build_navigation_guide() -> pd.DataFrame:
     return pd.DataFrame(
         [
-            ("Inicio (Forecast)", "Resumen directo: top/bottom, atrasadas y combinaciones candidatas."),
-            ("Perfil y Calidad", "Perfil del dataset y chequeos de calidad de filas."),
-            ("Frecuencia y Significancia", "Frecuencias observadas vs esperadas con CI, z, p y q(FDR)."),
-            ("Diagnosticos", "Buckets, ultimos digitos y estabilidad por eras."),
-            ("Recencia (Overdue)", "Numeros mas atrasados para white y Powerball."),
-            ("Estructura y Combinaciones", "Patrones por draw, pares/trios y heatmap de co-ocurrencia."),
-            ("Simulador Fisico", "Sensibilidad uniforme vs sesgo fisico hipotetico/medido."),
-            ("Rolling", "Serie temporal rolling para un numero puntual."),
-            ("Datos y Exportes", "Tabla cruda + export CSV/Excel."),
+            ("Resumen y combinaciones", "Ranking, extremos y tickets candidatos."),
+            ("Validación histórica", "Compara el modelo con el uniforme fuera de muestra."),
+            ("Frecuencias", "Observado vs esperado, z-score y significancia."),
+            ("Recencia", "Cuántos sorteos lleva cada número sin aparecer."),
+            ("Patrones y combinaciones", "Pares, tríos, sumas y estructura histórica."),
+            ("Diagnósticos avanzados", "Buckets, últimos dígitos y estabilidad entre eras."),
+            ("Calidad de datos", "Filas inválidas, rangos y perfil del archivo."),
+            ("Evolución temporal", "Frecuencia móvil de un número."),
+            ("Laboratorio experimental", "Escenarios físicos hipotéticos, separados del forecast."),
+            ("Datos y descargas", "Datos filtrados y exportación CSV/Excel."),
         ],
         columns=["Seccion", "Que muestra"],
     )
 
 
-st.title("Powerball Analytics Dashboard")
-st.caption("Upload a historical Powerball CSV, normalize mixed rule periods, and analyze frequency, deviation, recency, and combination structure.")
-
-left, right = st.columns([1.1, 1])
-with left:
-    uploaded = st.file_uploader("Upload Powerball CSV", type=["csv"])
-with right:
-    use_sample = st.checkbox("Use bundled sample file if no upload is provided", value=True)
+st.title("Powerball: análisis y forecast")
+st.caption("Datos oficiales, validación histórica y combinaciones exploratorias en una sola vista.")
 
 sample_path = Path(__file__).with_name("powerball.csv")
 now_ct = texas_now_ct()
-draw_day_enabled = is_powerball_draw_day_ct(now_ct)
-next_draw_ct = next_powerball_draw_day_ct(now_ct)
+source_mode = st.radio(
+    "Fuente de datos",
+    options=["Texas Lottery (automática)", "Subir mi CSV", "Copia local incluida"],
+    horizontal=True,
+    key="data_source_mode",
+)
+uploaded = None
+if source_mode == "Subir mi CSV":
+    uploaded = st.file_uploader("Selecciona el CSV de números ganadores", type=["csv"])
 
-with st.sidebar.expander("Actualizacion Data (Texas Lottery)", expanded=False):
-    st.markdown(f"[CSV oficial Texas Lottery]({TEXAS_POWERBALL_CSV_URL})")
-    st.caption(f"Hora Texas (CT): {now_ct.strftime('%Y-%m-%d %H:%M')}")
-    st.caption("El boton manual se habilita solo en dias de sorteo: Monday, Wednesday, Saturday.")
-    sync_clicked = st.button(
-        "Actualizar CSV oficial ahora",
-        disabled=not draw_day_enabled,
-        key="sync_texas_csv_button",
-    )
-    if sync_clicked:
-        try:
-            fresh_bytes = download_texas_powerball_csv()
-            fresh_df = parse_powerball_csv_bytes(fresh_bytes)
-            sample_path.write_bytes(fresh_bytes)
-            load_default_sample.clear()
-            st.success(
-                f"CSV actualizado: {len(fresh_df):,} sorteos | "
-                f"rango {fresh_df['draw_date'].min().date()} -> {fresh_df['draw_date'].max().date()}"
-            )
-        except URLError as exc:
-            st.error(f"No se pudo descargar el CSV oficial: {exc}")
-        except Exception as exc:
-            st.error(f"Error al validar/guardar el CSV: {exc}")
-    if not draw_day_enabled:
-        st.info(f"Boton deshabilitado hoy. Proximo dia de sorteo (CT): {next_draw_ct.strftime('%Y-%m-%d')}")
-    if sample_path.exists():
-        updated_at = datetime.fromtimestamp(sample_path.stat().st_mtime, ZoneInfo("America/New_York"))
-        st.caption(f"Archivo local `powerball.csv` actualizado: {updated_at.strftime('%Y-%m-%d %H:%M %Z')}")
-    if st.button("Releer CSV local (limpiar cache)", key="clear_local_csv_cache"):
+with st.sidebar.expander("Datos oficiales", expanded=True):
+    st.markdown(f"[Abrir CSV oficial de Texas Lottery]({TEXAS_POWERBALL_CSV_URL})")
+    st.caption("La fuente automática se renueva cada 6 horas. El botón fuerza una consulta inmediata.")
+    if st.button("Buscar actualización ahora", key="sync_texas_csv_button", use_container_width=True):
+        load_official_powerball.clear()
         st.cache_data.clear()
-        st.success("Cache limpiada. El dashboard releera el CSV local en este ciclo.")
+        st.success("Caché limpiada. Se consultará nuevamente la fuente oficial.")
+    st.caption(f"Hora Texas (CT): {now_ct.strftime('%Y-%m-%d %H:%M')}")
 
+data_source_label = source_mode
 if uploaded is not None:
     df = parse_powerball_csv_bytes(uploaded.getvalue())
-elif use_sample:
-    if sample_path.exists():
-        stat = sample_path.stat()
-        df = load_default_sample(file_mtime_ns=int(stat.st_mtime_ns), file_size=int(stat.st_size))
-    else:
-        df = load_default_sample()
+elif source_mode == "Texas Lottery (automática)":
+    try:
+        df = load_official_powerball()
+    except Exception as exc:
+        df = load_default_sample(
+            file_mtime_ns=int(sample_path.stat().st_mtime_ns) if sample_path.exists() else None,
+            file_size=int(sample_path.stat().st_size) if sample_path.exists() else None,
+        )
+        data_source_label = "Copia local de respaldo"
+        st.warning(f"No se pudo consultar Texas Lottery; se usa la copia local. Detalle: {exc}")
+elif source_mode == "Copia local incluida":
+    df = load_default_sample(
+        file_mtime_ns=int(sample_path.stat().st_mtime_ns) if sample_path.exists() else None,
+        file_size=int(sample_path.stat().st_size) if sample_path.exists() else None,
+    )
 else:
     df = None
 
@@ -1135,13 +1108,26 @@ if df is None or df.empty:
     st.info("Upload a CSV to begin.")
     st.stop()
 
-st.sidebar.header("Filters")
-era_options = ["All"] + list(df["era"].dropna().unique())
-selected_eras = st.sidebar.multiselect("Era", options=era_options, default=["All"])
-weekday_options = ["All"] + sorted(df["weekday"].dropna().unique().tolist())
-selected_weekdays = st.sidebar.multiselect("Weekday", options=weekday_options, default=["All"])
-year_options = ["All"] + [int(y) for y in sorted(df["year"].dropna().unique().tolist())]
-selected_years = st.sidebar.multiselect("Year", options=year_options, default=["All"])
+PAGE_LABELS = {
+    "Inicio (Forecast)": "1. Resumen y combinaciones",
+    "Validacion (Backtest)": "2. Validación histórica",
+    "Frecuencia y Significancia": "3. Frecuencias",
+    "Recencia (Overdue)": "4. Recencia",
+    "Estructura y Combinaciones": "5. Patrones y combinaciones",
+    "Diagnosticos": "6. Diagnósticos avanzados",
+    "Perfil y Calidad": "7. Calidad de datos",
+    "Rolling": "8. Evolución temporal",
+    "Simulador Fisico": "9. Laboratorio experimental",
+    "Datos y Exportes": "10. Datos y descargas",
+}
+st.sidebar.header("Secciones")
+page = st.sidebar.radio(
+    "Navegar",
+    options=list(PAGE_LABELS),
+    format_func=lambda value: PAGE_LABELS[value],
+    label_visibility="collapsed",
+)
+
 min_date, max_date = df["draw_date"].min().date(), df["draw_date"].max().date()
 csv_signature = (len(df), str(min_date), str(max_date))
 if st.session_state.get("date_range_csv_signature") != csv_signature:
@@ -1152,56 +1138,40 @@ if "start_date_filter" not in st.session_state:
     st.session_state["start_date_filter"] = min_date
 if "end_date_filter" not in st.session_state:
     st.session_state["end_date_filter"] = max_date
-st.sidebar.markdown("### FECHA DE INICIO")
-start_date_input = st.sidebar.date_input(
-    "FECHA DE INICIO",
-    min_value=min_date,
-    max_value=max_date,
-    value=st.session_state["start_date_filter"],
-    key="start_date_filter",
-    label_visibility="collapsed",
-)
-st.sidebar.markdown("### FECHA DE FIN")
-end_date_input = st.sidebar.date_input(
-    "FECHA DE FIN",
-    min_value=min_date,
-    max_value=max_date,
-    value=st.session_state["end_date_filter"],
-    key="end_date_filter",
-    label_visibility="collapsed",
-)
-st.sidebar.caption(f"Ultima fecha disponible en CSV: {max_date}")
-show_missing_pp = st.sidebar.checkbox("Keep rows with missing Power Play", value=True)
-bucket_size = st.sidebar.slider("Bucket size for diagnostics", min_value=5, max_value=20, value=10, step=1)
 
-st.sidebar.header("Composite Score Weights")
-weight_long = st.sidebar.slider("Long-run z-score", min_value=0.0, max_value=1.0, value=0.45, step=0.05)
-weight_recent = st.sidebar.slider("Recent 52-draw z-score", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
-weight_gap = st.sidebar.slider("Gap (overdue)", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
+era_options = ["All"] + list(df["era"].dropna().unique())
+weekday_options = ["All"] + sorted(df["weekday"].dropna().unique().tolist())
+year_options = ["All"] + [int(y) for y in sorted(df["year"].dropna().unique().tolist())]
+with st.sidebar.expander("Filtros de análisis", expanded=False):
+    st.caption("Afectan gráficos y tablas, no el forecast del próximo sorteo.")
+    selected_eras = st.multiselect("Era", options=era_options, default=["All"])
+    selected_weekdays = st.multiselect("Día de la semana", options=weekday_options, default=["All"])
+    selected_years = st.multiselect("Año", options=year_options, default=["All"])
+    start_date_input = st.date_input(
+        "Fecha de inicio",
+        min_value=min_date,
+        max_value=max_date,
+        value=st.session_state["start_date_filter"],
+        key="start_date_filter",
+    )
+    end_date_input = st.date_input(
+        "Fecha de fin",
+        min_value=min_date,
+        max_value=max_date,
+        value=st.session_state["end_date_filter"],
+        key="end_date_filter",
+    )
+    show_missing_pp = st.checkbox("Conservar filas sin Power Play", value=True)
 
-st.sidebar.header("Forecast Settings")
-forecast_strength_white = st.sidebar.slider("White forecast strength", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
-forecast_strength_pb = st.sidebar.slider("PB forecast strength", min_value=0.0, max_value=1.0, value=0.30, step=0.05)
-forecast_samples = st.sidebar.slider("Ticket simulation samples", min_value=5000, max_value=200000, value=50000, step=5000)
-forecast_top_tickets = st.sidebar.slider("Top simulated tickets", min_value=5, max_value=25, value=12, step=1)
-forecast_seed = st.sidebar.number_input("Forecast random seed", min_value=1, max_value=999999, value=42, step=1)
-overlap_penalty_lambda = st.sidebar.slider("Overlap penalty (diversity)", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
-
-st.sidebar.header("Navegacion")
-page = st.sidebar.radio(
-    "Ir a",
-    options=[
-        "Inicio (Forecast)",
-        "Perfil y Calidad",
-        "Frecuencia y Significancia",
-        "Diagnosticos",
-        "Recencia (Overdue)",
-        "Estructura y Combinaciones",
-        "Simulador Fisico",
-        "Rolling",
-        "Datos y Exportes",
-    ],
-)
+with st.sidebar.expander("Ajustes avanzados", expanded=False):
+    bucket_size = st.slider("Tamaño de buckets", min_value=5, max_value=20, value=10, step=1)
+    weight_long = st.slider("Score descriptivo: largo plazo", min_value=0.0, max_value=1.0, value=0.45, step=0.05)
+    weight_recent = st.slider("Score descriptivo: últimos 52", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
+    weight_gap = st.slider("Score descriptivo: atraso", min_value=0.0, max_value=1.0, value=0.20, step=0.05)
+    forecast_samples = st.slider("Simulaciones de tickets", min_value=10000, max_value=200000, value=50000, step=10000)
+    forecast_top_tickets = st.slider("Tickets candidatos", min_value=5, max_value=25, value=12, step=1)
+    forecast_seed = st.number_input("Semilla reproducible", min_value=1, max_value=999999, value=42, step=1)
+    overlap_penalty_lambda = st.slider("Diversidad entre tickets", min_value=0.0, max_value=1.0, value=0.35, step=0.05)
 
 filtered = df.copy()
 if "All" not in selected_eras:
@@ -1244,16 +1214,23 @@ white_score = trend_score_white(
 bucket_stats = bucket_deviation(white_exp, bucket_size=bucket_size)
 digit_stats = last_digit_deviation(white_exp)
 stability_df, stability_matrix = era_stability_white(filtered)
+forecast_source = current_matrix_draws(df)
+backtest_detail, backtest_summary, backtest_yearly, backtest_config = cached_walk_forward_backtest(df)
+forecast_strength_white = float(backtest_config.white_strength)
+forecast_strength_pb = float(backtest_config.powerball_strength)
+forecast_white_exp = add_significance_columns(mixed_expected_white(forecast_source))
+forecast_pb_exp = add_significance_columns(mixed_expected_powerball(forecast_source))
+forecast_white_score = trend_score_white(forecast_source, weight_long=0.65, weight_recent=0.35, weight_gap=0.0)
 white_forecast = statistical_forecast_white(
-    filtered=filtered,
-    white_exp=white_exp,
-    white_score=white_score,
+    filtered=forecast_source,
+    white_exp=forecast_white_exp,
+    white_score=forecast_white_score,
     strength=forecast_strength_white,
 )
 pb_forecast = statistical_forecast_pb(
-    filtered=filtered,
-    pb_exp=pb_exp,
-    pb_over=pb_over,
+    filtered=forecast_source,
+    pb_exp=forecast_pb_exp,
+    pb_over=overdue_powerball(forecast_source),
     strength=forecast_strength_pb,
 )
 ticket_sim_bundle = run_ticket_simulation_bundle(
@@ -1269,12 +1246,30 @@ sim_white_number_freq = ticket_sim_bundle["white_number_freq"]
 sim_powerball_freq = ticket_sim_bundle["powerball_freq"]
 sim_pair_freq = ticket_sim_bundle["pair_freq"]
 sim_triplet_freq = ticket_sim_bundle["triplet_freq"]
+if not sim_white_number_freq.empty:
+    white_forecast = white_forecast.drop(columns=["inclusion_prob_next_draw"], errors="ignore").merge(
+        sim_white_number_freq[["number", "appearance_rate"]].rename(
+            columns={"appearance_rate": "inclusion_prob_next_draw"}
+        ),
+        on="number",
+        how="left",
+    )
+    white_forecast = white_forecast.sort_values("rank").reset_index(drop=True)
+if not sim_powerball_freq.empty:
+    pb_forecast = pb_forecast.merge(
+        sim_powerball_freq[["number", "appearance_rate"]].rename(
+            columns={"appearance_rate": "simulated_probability"}
+        ),
+        on="number",
+        how="left",
+    )
+    pb_forecast = pb_forecast.sort_values("rank").reset_index(drop=True)
 
 c1, c2, c3, c4 = st.columns(4)
-c1.metric("Draws", f"{len(filtered):,}")
-c2.metric("Date span", f"{filtered['draw_date'].min().date()} → {filtered['draw_date'].max().date()}")
-c3.metric("Rows missing Power Play", f"{int(filtered['power_play'].isna().sum()):,}")
-c4.metric("Weekdays", ", ".join(sorted(filtered['weekday'].unique())))
+c1.metric("Fuente activa", data_source_label)
+c2.metric("Último sorteo disponible", str(df["draw_date"].max().date()))
+c3.metric("Sorteos para forecast", f"{len(forecast_source):,}")
+c4.metric("Sorteos en la vista", f"{len(filtered):,}")
 
 guide_df = build_navigation_guide()
 default_sim_df, default_sim_metrics = physical_bias_projection(
@@ -1287,33 +1282,36 @@ default_sim_df, default_sim_metrics = physical_bias_projection(
 )
 
 if page == "Inicio (Forecast)":
-    st.subheader("Inicio (Forecast)")
-    st.caption(
-        "Pantalla principal: forecast, extremos (mas/menos) y combinaciones candidatas. "
-        "La formula usa solo historico de numeros ganadores y prioriza el regimen activo (pool actual)."
+    st.subheader("Resumen y combinaciones")
+    st.markdown(
+        "<div class='accuracy-note'><b>Cómo leer esta página:</b> el ranking resume señales históricas débiles. "
+        "No cambia las probabilidades oficiales del juego. La confianza del modelo se calibra con sorteos "
+        "anteriores y el atraso se muestra solo como dato descriptivo.</div>",
+        unsafe_allow_html=True,
     )
-    st.dataframe(guide_df, width="stretch", hide_index=True)
+    with st.expander("Qué contiene cada sección"):
+        st.dataframe(guide_df, width="stretch", hide_index=True)
 
     if white_forecast.empty or pb_forecast.empty:
         st.info("No hay suficientes datos para construir forecast en el filtro actual.")
     else:
-        active_pool_white = int(filtered.iloc[-1]["white_pool_max"])
+        active_pool_white = int(forecast_source.iloc[-1]["white_pool_max"])
         white_range_filter = st.slider(
-            "Rango de numeros white para forecast",
+            "Limitar números white para las combinaciones",
             min_value=1,
             max_value=active_pool_white,
             value=(1, active_pool_white),
             key="home_forecast_white_range",
         )
         view_mode_white = st.radio(
-            "Vista white",
-            options=["Mas probables", "Menos probables", "Mas atrasadas", "Mas frias (z-score)"],
+            "Qué números white quieres ver",
+            options=["Mayor señal", "Menor señal", "Más atrasados"],
             horizontal=True,
             key="home_forecast_white_mode",
         )
         view_mode_pb = st.radio(
-            "Vista Powerball",
-            options=["Mas probables", "Menos probables", "Mas atrasadas"],
+            "Qué Powerball quieres ver",
+            options=["Mayor señal", "Menor señal", "Más atrasados"],
             horizontal=True,
             key="home_forecast_pb_mode",
         )
@@ -1329,18 +1327,16 @@ if page == "Inicio (Forecast)":
         white_filtered = white_forecast[
             (white_forecast["number"] >= white_range_filter[0]) & (white_forecast["number"] <= white_range_filter[1])
         ].copy()
-        if view_mode_white == "Mas probables":
+        if view_mode_white == "Mayor señal":
             white_view = white_filtered.sort_values("inclusion_prob_next_draw", ascending=False)
-        elif view_mode_white == "Menos probables":
+        elif view_mode_white == "Menor señal":
             white_view = white_filtered.sort_values("inclusion_prob_next_draw", ascending=True)
-        elif view_mode_white == "Mas atrasadas":
-            white_view = white_filtered.sort_values("draws_since_seen", ascending=False)
         else:
-            white_view = white_filtered.sort_values("z_score", ascending=True)
+            white_view = white_filtered.sort_values("draws_since_seen", ascending=False)
 
-        if view_mode_pb == "Mas probables":
+        if view_mode_pb == "Mayor señal":
             pb_view = pb_forecast.sort_values("draw_prob", ascending=False)
-        elif view_mode_pb == "Menos probables":
+        elif view_mode_pb == "Menor señal":
             pb_view = pb_forecast.sort_values("draw_prob", ascending=True)
         else:
             pb_view = pb_forecast.sort_values("draws_since_seen", ascending=False)
@@ -1350,17 +1346,74 @@ if page == "Inicio (Forecast)":
         top_pb = pb_forecast.sort_values("draw_prob", ascending=False).head(3)["number"].tolist()
         low_pb = pb_forecast.sort_values("draw_prob", ascending=True).head(3)["number"].tolist()
         fw1, fw2, fw3 = st.columns(3)
-        fw1.metric("Pool forecast white", f"1-{int(filtered.iloc[-1]['white_pool_max'])}")
-        fw2.metric("Top 5 white", ", ".join(str(n) for n in top_white))
-        fw3.metric("Bottom 5 white", ", ".join(str(n) for n in low_white))
+        fw1.metric("Matriz actual", f"5/1-{int(forecast_source.iloc[-1]['white_pool_max'])}")
+        fw2.metric("Mayor señal white", ", ".join(str(n) for n in top_white))
+        fw3.metric("Menor señal white", ", ".join(str(n) for n in low_white))
         fp1, fp2 = st.columns(2)
-        fp1.metric("Top 3 PB", ", ".join(str(n) for n in top_pb))
-        fp2.metric("Bottom 3 PB", ", ".join(str(n) for n in low_pb))
+        fp1.metric("Mayor señal PB", ", ".join(str(n) for n in top_pb))
+        fp2.metric("Menor señal PB", ", ".join(str(n) for n in low_pb))
 
-        st.markdown("### Data Clear: Combinaciones mas ganadoras")
+        white_ticket_base = white_filtered.copy()
+        if len(white_ticket_base) < 5:
+            white_ticket_base = white_forecast.copy()
+            st.info("El rango seleccionado tiene menos de cinco números; se usa la matriz white completa.")
+        home_bundle = run_ticket_simulation_bundle(
+            white_forecast=white_ticket_base,
+            pb_forecast=pb_forecast,
+            n_samples=int(forecast_samples),
+            top_n=int(forecast_top_tickets),
+            seed=int(forecast_seed),
+            overlap_lambda=float(overlap_penalty_lambda),
+        )
+        tickets_view = home_bundle["tickets"]
+        white_sim_view = home_bundle["white_number_freq"]
+        pb_sim_view = home_bundle["powerball_freq"]
+        pair_sim_view = home_bundle["pair_freq"]
+        triplet_sim_view = home_bundle["triplet_freq"]
+
+        st.divider()
+        st.markdown("### Combinaciones candidatas")
+        tickets_display = tickets_view.rename(
+            columns={
+                "ticket": "combinación",
+                "white_numbers": "white",
+                "powerball": "PB",
+                "sim_count": "apariciones_simuladas",
+                "sim_prob": "tasa_ticket",
+                "empirical_freq_score": "score_histórico",
+                "statistical_weight_score": "score_modelo",
+                "overlap_penalty": "solapamiento",
+                "ticket_score": "score_final",
+            }
+        )
+        st.dataframe(tickets_display.round(6), width="stretch", hide_index=True)
         st.caption(
-            "Ganadoras = combinaciones que mas se repiten en el historico filtrado. "
-            "Perdedoras = combinaciones vistas 1 sola vez (muestra)."
+            "El score ordena candidatos dentro del modelo experimental. La penalización de solapamiento busca "
+            "que los tickets cubran números distintos; no aumenta la probabilidad individual de cada ticket."
+        )
+        with st.expander("Ver frecuencias internas de la simulación"):
+            col_simfreq_a, col_simfreq_b = st.columns(2)
+            with col_simfreq_a:
+                st.markdown("**Aparición por simulación: números white**")
+                st.dataframe(white_sim_view.head(view_n), width="stretch", hide_index=True)
+                st.markdown("**Aparición por simulación: Powerball**")
+                st.dataframe(pb_sim_view.head(min(view_n, 20)), width="stretch", hide_index=True)
+            with col_simfreq_b:
+                st.markdown("**Aparición por simulación: pares**")
+                st.dataframe(pair_sim_view.head(view_n), width="stretch", hide_index=True)
+                st.markdown("**Aparición por simulación: tripletas**")
+                st.dataframe(triplet_sim_view.head(view_n), width="stretch", hide_index=True)
+        st.download_button(
+            "Descargar combinaciones candidatas",
+            tickets_display.to_csv(index=False).encode("utf-8"),
+            file_name="powerball_forecast_tickets.csv",
+            mime="text/csv",
+        )
+
+        st.divider()
+        st.markdown("### Histórico: combinaciones que ya aparecieron")
+        st.caption(
+            "Esta sección describe el archivo filtrado; no implica que una combinación repetida tenga más opción futura."
         )
 
         repeated_tickets = ticket_stats[ticket_stats["count"] >= 2].copy()
@@ -1379,7 +1432,7 @@ if page == "Inicio (Forecast)":
                 hide_index=True,
             )
         with col_combo_b:
-            st.markdown("**Combinaciones perdedoras (1 hit historico)**")
+            st.markdown("**Tickets vistos una sola vez**")
             st.dataframe(
                 one_hit_tickets[["ticket", "count", "last_seen", "draws_since_seen"]].head(view_n),
                 width="stretch",
@@ -1388,10 +1441,10 @@ if page == "Inicio (Forecast)":
 
         col_combo_c, col_combo_d = st.columns(2)
         with col_combo_c:
-            st.markdown("**Top pares white (historico)**")
+            st.markdown("**Pares con mayor desviación vs esperado por era**")
             st.dataframe(pair_top.head(view_n), width="stretch", hide_index=True)
         with col_combo_d:
-            st.markdown("**Top trios white (historico)**")
+            st.markdown("**Tríos con mayor desviación vs esperado por era**")
             st.dataframe(triplet_top.head(view_n), width="stretch", hide_index=True)
 
         col_fw_a, col_fw_b = st.columns(2)
@@ -1400,17 +1453,17 @@ if page == "Inicio (Forecast)":
                 white_view.head(view_n),
                 x="number",
                 y="inclusion_prob_next_draw",
-                title=f"White forecast ({view_mode_white})",
+                title=f"White: {view_mode_white}",
                 hover_data={"draw_prob": ":.4f", "lift_vs_uniform_pct": ":.2f", "z_score": ":.2f"},
             )
-            fig.update_layout(height=340, yaxis_title="Prob. inclusion (aprox)")
+            fig.update_layout(height=340, yaxis_title="Frecuencia de inclusión simulada")
             st.plotly_chart(fig, width="stretch")
         with col_fw_b:
             fig = px.bar(
                 pb_view.head(min(20, view_n)),
                 x="number",
                 y="draw_prob",
-                title=f"Powerball forecast ({view_mode_pb})",
+                title=f"Powerball: {view_mode_pb}",
                 hover_data={"lift_vs_uniform_pct": ":.2f", "z_score": ":.2f", "draws_since_seen": True},
             )
             fig.update_layout(height=340, yaxis_title="Probabilidad")
@@ -1427,8 +1480,7 @@ if page == "Inicio (Forecast)":
                         "draw_prob",
                         "lift_vs_uniform_pct",
                         "z_score",
-                        "recent_52_z",
-                        "gap_z",
+                        "draws_since_seen",
                     ]
                 ].head(view_n),
                 width="stretch",
@@ -1450,48 +1502,86 @@ if page == "Inicio (Forecast)":
                 hide_index=True,
             )
 
-        white_ticket_base = white_filtered.copy()
-        if len(white_ticket_base) < 5:
-            white_ticket_base = white_forecast.copy()
-            st.info("Rango white muy corto para tickets; simulacion usa el pool completo.")
-        home_bundle = run_ticket_simulation_bundle(
-            white_forecast=white_ticket_base,
-            pb_forecast=pb_forecast,
-            n_samples=int(forecast_samples),
-            top_n=int(forecast_top_tickets),
-            seed=int(forecast_seed),
-            overlap_lambda=float(overlap_penalty_lambda),
-        )
-        tickets_view = home_bundle["tickets"]
-        white_sim_view = home_bundle["white_number_freq"]
-        pb_sim_view = home_bundle["powerball_freq"]
-        pair_sim_view = home_bundle["pair_freq"]
-        triplet_sim_view = home_bundle["triplet_freq"]
+elif page == "Validacion (Backtest)":
+    st.subheader("Validación histórica")
+    st.caption(
+        "El modelo se recalcula antes de cada sorteo usando únicamente información disponible hasta ese momento. "
+        "La primera parte calibra la intensidad y la última parte funciona como prueba fuera de muestra."
+    )
+    if backtest_summary.empty:
+        st.warning("No hay suficientes sorteos de la matriz actual para ejecutar el backtest.")
+    else:
+        white_brier = backtest_summary.loc[backtest_summary["metric"].eq("White Brier")].iloc[0]
+        pb_brier = backtest_summary.loc[backtest_summary["metric"].eq("Powerball Brier")].iloc[0]
+        bt1, bt2, bt3, bt4 = st.columns(4)
+        bt1.metric("Sorteos de calibración", f"{backtest_config.calibration_draws:,}")
+        bt2.metric("Sorteos fuera de muestra", f"{backtest_config.holdout_draws:,}")
+        bt3.metric("Intensidad white", f"{backtest_config.white_strength:.3f}")
+        bt4.metric("Intensidad Powerball", f"{backtest_config.powerball_strength:.3f}")
 
-        st.markdown("**Combinaciones candidatas (simulacion + score)**")
-        st.dataframe(tickets_view, width="stretch", hide_index=True)
-        st.caption(
-            "Score separado por ticket: `empirical_freq_score`, `statistical_weight_score`, "
-            "`overlap_penalty`, `ticket_score`."
+        def validation_label(row):
+            improvement = float(row["relative_improvement_pct"])
+            if improvement >= 1.0:
+                return "Mejora visible"
+            if improvement > 0:
+                return "Diferencia mínima"
+            return "No supera uniforme"
+
+        white_result = validation_label(white_brier)
+        pb_result = validation_label(pb_brier)
+        result_col1, result_col2 = st.columns(2)
+        result_col1.metric("Calibración white", white_result, f"Δ Brier {white_brier['delta']:+.6f}")
+        result_col2.metric("Calibración Powerball", pb_result, f"Δ Brier {pb_brier['delta']:+.6f}")
+
+        st.markdown(
+            "<div class='accuracy-note'><b>Regla de lectura:</b> Brier y log-loss deben ser menores que el "
+            "uniforme. Los hits top-k deben ser mayores. Una mejora aislada no demuestra capacidad predictiva; "
+            "también debe mantenerse entre años.</div>",
+            unsafe_allow_html=True,
         )
-        col_simfreq_a, col_simfreq_b = st.columns(2)
-        with col_simfreq_a:
-            st.markdown("**Frecuencia simulada: numeros white**")
-            st.dataframe(white_sim_view.head(view_n), width="stretch", hide_index=True)
-            st.markdown("**Frecuencia simulada: Powerball**")
-            st.dataframe(pb_sim_view.head(min(view_n, 20)), width="stretch", hide_index=True)
-        with col_simfreq_b:
-            st.markdown("**Frecuencia simulada: pares**")
-            st.dataframe(pair_sim_view.head(view_n), width="stretch", hide_index=True)
-            st.markdown("**Frecuencia simulada: tripletas**")
-            st.dataframe(triplet_sim_view.head(view_n), width="stretch", hide_index=True)
-        forecast_csv = tickets_view.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download forecast tickets (CSV)",
-            forecast_csv,
-            file_name="powerball_forecast_tickets.csv",
-            mime="text/csv",
+
+        summary_view = backtest_summary[
+            ["metric", "uniform", "model", "delta", "relative_improvement_pct", "beats_uniform"]
+        ].copy()
+        summary_view[["uniform", "model", "delta"]] = summary_view[["uniform", "model", "delta"]].round(6)
+        summary_view = summary_view.rename(
+            columns={
+                "metric": "métrica",
+                "uniform": "uniforme",
+                "model": "modelo",
+                "delta": "diferencia",
+                "relative_improvement_pct": "mejora_relativa_pct",
+                "beats_uniform": "supera_uniforme",
+            }
         )
+        st.dataframe(summary_view, width="stretch", hide_index=True)
+
+        chart_yearly = backtest_yearly.melt(
+            id_vars=["year"],
+            value_vars=["white_brier_uniform", "white_brier_model"],
+            var_name="serie",
+            value_name="brier",
+        )
+        fig = px.line(
+            chart_yearly,
+            x="year",
+            y="brier",
+            color="serie",
+            markers=True,
+            title="Brier white por año: modelo vs uniforme",
+        )
+        fig.update_layout(height=360, yaxis_title="Brier (menor es mejor)")
+        st.plotly_chart(fig, width="stretch")
+        st.dataframe(backtest_yearly.round(6), width="stretch", hide_index=True)
+
+        with st.expander("Ver resultados sorteo por sorteo"):
+            st.dataframe(backtest_detail.round(6), width="stretch", hide_index=True)
+            st.download_button(
+                "Descargar backtest CSV",
+                backtest_detail.to_csv(index=False).encode("utf-8"),
+                file_name="powerball_backtest.csv",
+                mime="text/csv",
+            )
 
 elif page == "Perfil y Calidad":
     st.subheader("Perfil y Calidad")
@@ -1533,6 +1623,7 @@ elif page == "Perfil y Calidad":
                     "powerball",
                     "era",
                     "duplicate_white_in_draw",
+                    "duplicate_draw_date",
                     "white_out_of_range",
                     "powerball_out_of_range",
                 ]
@@ -1678,8 +1769,10 @@ elif page == "Estructura y Combinaciones":
         st.plotly_chart(fig, width="stretch")
     col_j, col_k = st.columns(2)
     with col_j:
+        st.markdown("**Pares ajustados por la matriz de cada era**")
         st.dataframe(pair_frequency(filtered, top_n=20), width="stretch", hide_index=True)
     with col_k:
+        st.markdown("**Tríos ajustados por la matriz de cada era**")
         st.dataframe(triplet_frequency(filtered, top_n=15), width="stretch", hide_index=True)
     if not pair_matrix.empty:
         fig = go.Figure(
@@ -1833,612 +1926,3 @@ else:
         st.info("Install `openpyxl` to enable Excel export.")
 
 st.stop()
-
-with st.expander("Dataset profile", expanded=True):
-    profile = pd.DataFrame(
-        {
-            "metric": [
-                "Rows",
-                "First draw",
-                "Last draw",
-                "Era count",
-                "Power Play missing rows",
-                "White number max observed",
-                "Powerball max observed",
-            ],
-            "value": [
-                len(filtered),
-                filtered["draw_date"].min().date(),
-                filtered["draw_date"].max().date(),
-                filtered["era"].nunique(),
-                int(filtered["power_play"].isna().sum()),
-                int(filtered[WHITE_COLS].max().max()),
-                int(filtered["powerball"].max()),
-            ],
-        }
-    )
-    profile["value"] = profile["value"].astype(str)
-    st.dataframe(profile, width="stretch", hide_index=True)
-    era_counts = filtered["era"].value_counts().rename_axis("era").reset_index(name="draws")
-    st.dataframe(era_counts, width="stretch", hide_index=True)
-
-with st.expander("Data quality checks", expanded=False):
-    st.dataframe(quality_summary, width="stretch", hide_index=True)
-    if not quality_issues.empty:
-        st.warning("Rows with issues detected. Review before interpreting results.")
-        st.dataframe(
-            quality_issues[
-                [
-                    "draw_date",
-                    *WHITE_COLS,
-                    "powerball",
-                    "era",
-                    "duplicate_white_in_draw",
-                    "white_out_of_range",
-                    "powerball_out_of_range",
-                ]
-            ],
-            width="stretch",
-            hide_index=True,
-        )
-    else:
-        st.success("No duplicate/out-of-range issues found in the current filtered dataset.")
-
-st.subheader("Frequency and deviation")
-st.caption(
-    "Los numeros jugables son enteros (`number`, `observed`). "
-    "Los decimales (`expected`, `z_score`, `p_value`, `q_value`) son metricas estadisticas."
-)
-col_a, col_b = st.columns(2)
-with col_a:
-    st.markdown(f"**White balls chi-square**: χ²={white_chi['chi2']:.2f}, df={int(white_chi['df'])}, p={format_p(white_chi['p_value'])}")
-    fig = go.Figure()
-    fig.add_bar(x=white_exp["number"], y=white_exp["observed"], name="Observed")
-    fig.add_scatter(
-        x=white_exp["number"],
-        y=white_exp["expected_ci_high"],
-        name="95% CI upper",
-        mode="lines",
-        line=dict(width=0),
-        showlegend=False,
-    )
-    fig.add_scatter(
-        x=white_exp["number"],
-        y=white_exp["expected_ci_low"],
-        name="95% CI",
-        mode="lines",
-        fill="tonexty",
-        fillcolor="rgba(99, 110, 250, 0.15)",
-        line=dict(width=0),
-    )
-    fig.add_scatter(x=white_exp["number"], y=white_exp["expected"], name="Expected", mode="lines+markers")
-    fig.update_layout(height=360, xaxis_title="White ball", yaxis_title="Count")
-    st.plotly_chart(fig, width="stretch")
-    white_table = white_exp.sort_values("z_score", ascending=False)[
-        ["number", "observed", "expected", "z_score", "p_value_two_sided", "q_value_fdr", "is_fdr_5pct"]
-    ].head(15).copy()
-    white_table["number"] = white_table["number"].astype(int)
-    white_table["observed"] = white_table["observed"].astype(int)
-    white_table["expected"] = white_table["expected"].round(2)
-    white_table["z_score"] = white_table["z_score"].round(3)
-    white_table["p_value_two_sided"] = white_table["p_value_two_sided"].round(4)
-    white_table["q_value_fdr"] = white_table["q_value_fdr"].round(4)
-    st.dataframe(
-        white_table,
-        width="stretch",
-        hide_index=True,
-    )
-
-with col_b:
-    st.markdown(f"**Powerball chi-square**: χ²={pb_chi['chi2']:.2f}, df={int(pb_chi['df'])}, p={format_p(pb_chi['p_value'])}")
-    fig = go.Figure()
-    fig.add_bar(x=pb_exp["number"], y=pb_exp["observed"], name="Observed")
-    fig.add_scatter(
-        x=pb_exp["number"],
-        y=pb_exp["expected_ci_high"],
-        name="95% CI upper",
-        mode="lines",
-        line=dict(width=0),
-        showlegend=False,
-    )
-    fig.add_scatter(
-        x=pb_exp["number"],
-        y=pb_exp["expected_ci_low"],
-        name="95% CI",
-        mode="lines",
-        fill="tonexty",
-        fillcolor="rgba(239, 85, 59, 0.15)",
-        line=dict(width=0),
-    )
-    fig.add_scatter(x=pb_exp["number"], y=pb_exp["expected"], name="Expected", mode="lines+markers")
-    fig.update_layout(height=360, xaxis_title="Powerball", yaxis_title="Count")
-    st.plotly_chart(fig, width="stretch")
-    pb_table = pb_exp.sort_values("z_score", ascending=False)[
-        ["number", "observed", "expected", "z_score", "p_value_two_sided", "q_value_fdr", "is_fdr_5pct"]
-    ].head(12).copy()
-    pb_table["number"] = pb_table["number"].astype(int)
-    pb_table["observed"] = pb_table["observed"].astype(int)
-    pb_table["expected"] = pb_table["expected"].round(2)
-    pb_table["z_score"] = pb_table["z_score"].round(3)
-    pb_table["p_value_two_sided"] = pb_table["p_value_two_sided"].round(4)
-    pb_table["q_value_fdr"] = pb_table["q_value_fdr"].round(4)
-    st.dataframe(
-        pb_table,
-        width="stretch",
-        hide_index=True,
-    )
-
-st.subheader("Data-only diagnostics")
-corr = white_exp["number"].corr(white_exp["z_score"]) if not white_exp.empty else np.nan
-top_bucket = bucket_stats.sort_values("pct_vs_expected", ascending=False).head(1)
-top_digit = digit_stats.sort_values("pct_vs_expected", ascending=False).head(1)
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Corr(number, z-score)", "N/A" if pd.isna(corr) else f"{corr:.3f}")
-m2.metric(
-    "Top bucket vs expected",
-    "N/A" if top_bucket.empty else f"{top_bucket.iloc[0]['bucket']} ({top_bucket.iloc[0]['pct_vs_expected']:+.2f}%)",
-)
-m3.metric(
-    "Top last digit vs expected",
-    "N/A" if top_digit.empty else f"{int(top_digit.iloc[0]['last_digit'])} ({top_digit.iloc[0]['pct_vs_expected']:+.2f}%)",
-)
-m4.metric(
-    "Numbers with consistent sign across eras",
-    f"{int(stability_df[(stability_df['active_eras'] >= 2) & (stability_df['consistent_sign'])].shape[0]):,}",
-)
-
-col_diag_a, col_diag_b = st.columns(2)
-with col_diag_a:
-    fig = px.scatter(
-        white_exp.sort_values("number"),
-        x="number",
-        y="z_score",
-        hover_data={"observed": True, "expected": ":.2f", "delta": ":.2f"},
-        title="White number vs z-score",
-    )
-    fig.update_layout(height=320)
-    st.plotly_chart(fig, width="stretch")
-with col_diag_b:
-    fig = px.bar(
-        bucket_stats,
-        x="bucket",
-        y="pct_vs_expected",
-        title="Bucket deviation vs expected (%)",
-    )
-    fig.update_layout(height=320, yaxis_title="% vs expected")
-    st.plotly_chart(fig, width="stretch")
-
-col_diag_c, col_diag_d = st.columns(2)
-with col_diag_c:
-    fig = px.bar(
-        digit_stats,
-        x="last_digit",
-        y="pct_vs_expected",
-        title="Last-digit deviation vs expected (%)",
-    )
-    fig.update_layout(height=320, yaxis_title="% vs expected")
-    st.plotly_chart(fig, width="stretch")
-with col_diag_d:
-    if stability_matrix.shape[1] > 2:
-        heat = stability_matrix.set_index("number")
-        fig = go.Figure(
-            data=go.Heatmap(
-                z=heat.to_numpy(),
-                x=heat.columns.tolist(),
-                y=heat.index.tolist(),
-                colorscale="RdBu",
-                zmid=0,
-                colorbar=dict(title="z-score"),
-            )
-        )
-        fig.update_layout(height=320, title="Era stability heatmap (z-score)")
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.info("Era-stability heatmap requires at least 2 active eras in current filters.")
-
-cons_above = stability_df[
-    (stability_df["active_eras"] >= 2) & (stability_df["consistent_sign"]) & (stability_df["mean_z"] > 0)
-].sort_values(["mean_z", "std_z"], ascending=[False, True])
-cons_below = stability_df[
-    (stability_df["active_eras"] >= 2) & (stability_df["consistent_sign"]) & (stability_df["mean_z"] < 0)
-].sort_values(["mean_z", "std_z"], ascending=[True, True])
-col_cons_a, col_cons_b = st.columns(2)
-with col_cons_a:
-    st.markdown("**Consistently above expected (across eras)**")
-    st.dataframe(cons_above.head(12), width="stretch", hide_index=True)
-with col_cons_b:
-    st.markdown("**Consistently below expected (across eras)**")
-    st.dataframe(cons_below.head(12), width="stretch", hide_index=True)
-
-st.subheader("Recency / overdue")
-col_c, col_d = st.columns(2)
-with col_c:
-    st.dataframe(white_over.head(15), width="stretch", hide_index=True)
-with col_d:
-    st.dataframe(pb_over.head(12), width="stretch", hide_index=True)
-
-st.subheader("Structure of draws")
-col_e, col_f, col_g = st.columns(3)
-with col_e:
-    fig = px.histogram(filtered, x="white_sum", nbins=25, title="Distribution of white-ball sum")
-    fig.update_layout(height=320)
-    st.plotly_chart(fig, width="stretch")
-with col_f:
-    odd_mix = filtered["odd_count"].value_counts().sort_index().rename_axis("odd_count").reset_index(name="draws")
-    fig = px.bar(odd_mix, x="odd_count", y="draws", title="Odd/Even mix")
-    fig.update_layout(height=320)
-    st.plotly_chart(fig, width="stretch")
-with col_g:
-    cons = filtered["consecutive_pairs"].value_counts().sort_index().rename_axis("consecutive_pairs").reset_index(name="draws")
-    fig = px.bar(cons, x="consecutive_pairs", y="draws", title="Consecutive pairs per draw")
-    fig.update_layout(height=320)
-    st.plotly_chart(fig, width="stretch")
-
-col_h, col_i = st.columns(2)
-with col_h:
-    repeat_dist = filtered["repeat_from_prev_draw"].value_counts().sort_index().rename_axis("repeat_from_prev_draw").reset_index(name="draws")
-    fig = px.bar(repeat_dist, x="repeat_from_prev_draw", y="draws", title="Repeats from previous draw")
-    fig.update_layout(height=320)
-    st.plotly_chart(fig, width="stretch")
-with col_i:
-    range_dist = filtered["white_range"].value_counts().sort_index().rename_axis("white_range").reset_index(name="draws")
-    fig = px.bar(range_dist, x="white_range", y="draws", title="Range width of white numbers")
-    fig.update_layout(height=320)
-    st.plotly_chart(fig, width="stretch")
-
-st.subheader("Combinations")
-col_j, col_k = st.columns(2)
-with col_j:
-    st.dataframe(pair_frequency(filtered, top_n=20), width="stretch", hide_index=True)
-with col_k:
-    st.dataframe(triplet_frequency(filtered, top_n=15), width="stretch", hide_index=True)
-
-if not pair_matrix.empty:
-    fig = go.Figure(
-        data=go.Heatmap(
-            z=pair_matrix.to_numpy(),
-            x=pair_matrix.columns.tolist(),
-            y=pair_matrix.index.tolist(),
-            colorscale="Blues",
-            colorbar=dict(title="Co-occurrence"),
-        )
-    )
-    fig.update_layout(
-        height=430,
-        title="Pair co-occurrence heatmap (top 20 most frequent white numbers)",
-        xaxis_title="White number",
-        yaxis_title="White number",
-    )
-    st.plotly_chart(fig, width="stretch")
-
-st.subheader("Forecast estadistico (experimental)")
-st.caption(
-    "Forecast exploratorio para el proximo sorteo usando senal estadistica (z-score, recencia y gap), "
-    "sin afirmar capacidad predictiva garantizada."
-)
-
-if not white_forecast.empty and not pb_forecast.empty:
-    active_pool_white = int(filtered.iloc[-1]["white_pool_max"])
-    white_range_filter = st.slider(
-        "Rango de numeros white para forecast",
-        min_value=1,
-        max_value=active_pool_white,
-        value=(1, active_pool_white),
-        key="forecast_white_range",
-    )
-    view_mode_white = st.radio(
-        "Vista white",
-        options=["Mas probables", "Menos probables", "Mas atrasadas", "Mas frias (z-score)"],
-        horizontal=True,
-        key="forecast_white_mode",
-    )
-    view_mode_pb = st.radio(
-        "Vista Powerball",
-        options=["Mas probables", "Menos probables", "Mas atrasadas"],
-        horizontal=True,
-        key="forecast_pb_mode",
-    )
-    view_n = st.slider("Cantidad a mostrar", min_value=5, max_value=30, value=15, step=1, key="forecast_view_n")
-
-    white_filtered = white_forecast[
-        (white_forecast["number"] >= white_range_filter[0]) & (white_forecast["number"] <= white_range_filter[1])
-    ].copy()
-    if view_mode_white == "Mas probables":
-        white_view = white_filtered.sort_values("inclusion_prob_next_draw", ascending=False)
-    elif view_mode_white == "Menos probables":
-        white_view = white_filtered.sort_values("inclusion_prob_next_draw", ascending=True)
-    elif view_mode_white == "Mas atrasadas":
-        white_view = white_filtered.sort_values("draws_since_seen", ascending=False)
-    else:
-        white_view = white_filtered.sort_values("z_score", ascending=True)
-
-    if view_mode_pb == "Mas probables":
-        pb_view = pb_forecast.sort_values("draw_prob", ascending=False)
-    elif view_mode_pb == "Menos probables":
-        pb_view = pb_forecast.sort_values("draw_prob", ascending=True)
-    else:
-        pb_view = pb_forecast.sort_values("draws_since_seen", ascending=False)
-
-    top_white = white_forecast.sort_values("inclusion_prob_next_draw", ascending=False).head(5)["number"].tolist()
-    low_white = white_forecast.sort_values("inclusion_prob_next_draw", ascending=True).head(5)["number"].tolist()
-    top_pb = pb_forecast.sort_values("draw_prob", ascending=False).head(3)["number"].tolist()
-    low_pb = pb_forecast.sort_values("draw_prob", ascending=True).head(3)["number"].tolist()
-    fw1, fw2, fw3 = st.columns(3)
-    fw1.metric("Pool forecast white", f"1-{int(filtered.iloc[-1]['white_pool_max'])}")
-    fw2.metric("Top 5 white", ", ".join(str(n) for n in top_white))
-    fw3.metric("Bottom 5 white", ", ".join(str(n) for n in low_white))
-
-    fp1, fp2 = st.columns(2)
-    fp1.metric("Top 3 PB", ", ".join(str(n) for n in top_pb))
-    fp2.metric("Bottom 3 PB", ", ".join(str(n) for n in low_pb))
-
-    col_fw_a, col_fw_b = st.columns(2)
-    with col_fw_a:
-        fig = px.bar(
-            white_view.head(view_n),
-            x="number",
-            y="inclusion_prob_next_draw",
-            title=f"White forecast ({view_mode_white})",
-            hover_data={"draw_prob": ":.4f", "lift_vs_uniform_pct": ":.2f", "z_score": ":.2f"},
-        )
-        fig.update_layout(height=340, yaxis_title="Prob. inclusion (aprox)")
-        st.plotly_chart(fig, width="stretch")
-    with col_fw_b:
-        fig = px.bar(
-            pb_view.head(min(20, view_n)),
-            x="number",
-            y="draw_prob",
-            title=f"Powerball forecast ({view_mode_pb})",
-            hover_data={"lift_vs_uniform_pct": ":.2f", "z_score": ":.2f", "draws_since_seen": True},
-        )
-        fig.update_layout(height=340, yaxis_title="Probabilidad")
-        st.plotly_chart(fig, width="stretch")
-
-    col_fw_c, col_fw_d = st.columns(2)
-    with col_fw_c:
-        st.markdown("**Ranking white (forecast)**")
-        st.dataframe(
-            white_view[
-                [
-                    "rank",
-                    "number",
-                    "inclusion_prob_next_draw",
-                    "draw_prob",
-                    "lift_vs_uniform_pct",
-                    "z_score",
-                    "recent_52_z",
-                    "gap_z",
-                ]
-            ].head(view_n),
-            width="stretch",
-            hide_index=True,
-        )
-    with col_fw_d:
-        st.markdown("**Ranking Powerball (forecast)**")
-        st.dataframe(
-            pb_view[
-                [
-                    "rank",
-                    "number",
-                    "draw_prob",
-                    "lift_vs_uniform_pct",
-                    "z_score",
-                    "draws_since_seen",
-                ]
-            ].head(view_n),
-            width="stretch",
-            hide_index=True,
-        )
-
-    col_ext_a, col_ext_b = st.columns(2)
-    with col_ext_a:
-        st.markdown("**White mas probables**")
-        st.dataframe(
-            white_forecast.sort_values("inclusion_prob_next_draw", ascending=False)[
-                ["number", "inclusion_prob_next_draw", "lift_vs_uniform_pct", "draws_since_seen"]
-            ].head(view_n),
-            width="stretch",
-            hide_index=True,
-        )
-    with col_ext_b:
-        st.markdown("**White menos probables**")
-        st.dataframe(
-            white_forecast.sort_values("inclusion_prob_next_draw", ascending=True)[
-                ["number", "inclusion_prob_next_draw", "lift_vs_uniform_pct", "draws_since_seen"]
-            ].head(view_n),
-            width="stretch",
-            hide_index=True,
-        )
-
-    white_ticket_base = white_filtered.copy()
-    if len(white_ticket_base) < 5:
-        white_ticket_base = white_forecast.copy()
-        st.info("Rango white muy corto para tickets; simulacion usa el pool completo.")
-    tickets_forecast = simulate_forecast_tickets(
-        white_forecast=white_ticket_base,
-        pb_forecast=pb_forecast,
-        n_samples=int(forecast_samples),
-        top_n=int(forecast_top_tickets),
-        seed=int(forecast_seed),
-    )
-
-    st.markdown("**Combinaciones candidatas (simulacion + score)**")
-    st.dataframe(tickets_forecast, width="stretch", hide_index=True)
-    forecast_csv = tickets_forecast.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "Download forecast tickets (CSV)",
-        forecast_csv,
-        file_name="powerball_forecast_tickets.csv",
-        mime="text/csv",
-    )
-else:
-    st.info("No hay suficientes datos para construir forecast en el filtro actual.")
-
-st.subheader("Composite score (experimental)")
-total_score_weight = weight_long + weight_recent + weight_gap
-if total_score_weight <= 0:
-    total_score_weight = 1.0
-st.caption(
-    "Ranking only. Not predictive proof. Normalized weights: "
-    f"long={weight_long / total_score_weight:.2f}, "
-    f"recent={weight_recent / total_score_weight:.2f}, "
-    f"gap={weight_gap / total_score_weight:.2f}."
-)
-st.dataframe(
-    white_score[["number", "observed", "expected", "z_score", "recent_52_z", "draws_since_seen", "exploration_score"]].head(20),
-    width="stretch",
-    hide_index=True,
-)
-
-st.subheader("Physical Bias Simulator (experimental)")
-st.caption(
-    "This section is for sensitivity analysis only. It compares an era-aware uniform baseline against optional "
-    "weight/wear signals and should not be treated as a prediction engine."
-)
-
-weight_upload = st.file_uploader(
-    "Optional measured weights CSV (columns: number,weight)",
-    type=["csv"],
-    key="weights_upload",
-)
-measured_weights_df = None
-missing_weight_rows = 0
-if weight_upload is not None:
-    try:
-        measured_weights_df, missing_weight_rows = parse_weights_csv_bytes(
-            weight_upload.getvalue(), int(filtered["white_pool_max"].max())
-        )
-        st.success(
-            f"Measured weights loaded for {len(measured_weights_df) - missing_weight_rows} numbers; "
-            f"imputed {missing_weight_rows} missing numbers."
-        )
-    except ValueError as exc:
-        st.warning(f"Weights file ignored: {exc}")
-
-sim_mode = st.radio(
-    "Simulation mode",
-    options=["Uniform", "Weight bias", "Weight + wear"],
-    horizontal=True,
-)
-include_weight = sim_mode in {"Weight bias", "Weight + wear"}
-include_wear = sim_mode == "Weight + wear"
-beta = 0.0
-gamma = 0.0
-if include_weight:
-    beta = st.slider("Weight bias intensity (beta)", min_value=-0.30, max_value=0.30, value=0.05, step=0.01)
-if include_wear:
-    gamma = st.slider("Wear intensity (gamma)", min_value=-0.30, max_value=0.30, value=0.03, step=0.01)
-
-sim_df, sim_metrics = physical_bias_projection(
-    white_exp,
-    include_weight=include_weight,
-    include_wear=include_wear,
-    beta=beta,
-    gamma=gamma,
-    measured_weights=measured_weights_df,
-)
-
-if include_weight and measured_weights_df is None:
-    st.info("No measured weights uploaded. Using hypothetical weight signal based on number rank.")
-elif include_weight and measured_weights_df is not None:
-    st.info("Using measured weight signal from uploaded CSV.")
-
-sim_m1, sim_m2, sim_m3, sim_m4 = st.columns(4)
-sim_m1.metric("Weight source", sim_metrics.get("weight_source", "N/A"))
-sim_m2.metric("Chi-square (uniform)", f"{sim_metrics.get('chi2_uniform', np.nan):.2f}")
-sim_m3.metric("Chi-square (simulated)", f"{sim_metrics.get('chi2_adjusted', np.nan):.2f}")
-sim_m4.metric("Delta χ² (uniform - sim)", f"{sim_metrics.get('chi2_delta', np.nan):+.2f}")
-
-col_sim_a, col_sim_b = st.columns(2)
-with col_sim_a:
-    sim_plot = sim_df.sort_values("number")
-    fig = go.Figure()
-    fig.add_scatter(x=sim_plot["number"], y=sim_plot["baseline_prob"], name="Uniform baseline", mode="lines")
-    fig.add_scatter(x=sim_plot["number"], y=sim_plot["adjusted_prob"], name="Simulated", mode="lines")
-    fig.update_layout(height=320, title="Probability curve: uniform vs simulated", xaxis_title="Number", yaxis_title="Probability")
-    st.plotly_chart(fig, width="stretch")
-with col_sim_b:
-    top_lift = sim_df.sort_values("prob_lift_pct", ascending=False).head(15)
-    fig = px.bar(top_lift, x="number", y="prob_lift_pct", title="Top probability lift (%)")
-    fig.update_layout(height=320, yaxis_title="% lift vs uniform")
-    st.plotly_chart(fig, width="stretch")
-
-st.dataframe(
-    sim_df[["number", "observed", "expected", "adjusted_expected", "prob_lift_pct", "expected_delta"]].head(20),
-    width="stretch",
-    hide_index=True,
-)
-
-st.subheader("Rolling view")
-max_white_num = int(filtered["white_pool_max"].max())
-default_num = min(21, max_white_num)
-rolling_window = st.slider("Rolling window (draws)", min_value=26, max_value=156, value=52, step=13, key="rolling_window")
-rolling_mode = st.radio(
-    "Numero para rolling",
-    options=["Manual", "Top forecast", "Bottom forecast", "Most overdue"],
-    horizontal=True,
-    key="rolling_mode",
-)
-
-if rolling_mode == "Manual" or white_forecast.empty:
-    number_selected = st.slider("Inspect white-ball rolling hits", min_value=1, max_value=max_white_num, value=default_num)
-elif rolling_mode == "Top forecast":
-    top_options = white_forecast.sort_values("inclusion_prob_next_draw", ascending=False).head(20)["number"].tolist()
-    number_selected = st.selectbox("Pick from top forecast", options=top_options, index=0, key="rolling_top_pick")
-elif rolling_mode == "Bottom forecast":
-    bottom_options = white_forecast.sort_values("inclusion_prob_next_draw", ascending=True).head(20)["number"].tolist()
-    number_selected = st.selectbox("Pick from bottom forecast", options=bottom_options, index=0, key="rolling_bottom_pick")
-else:
-    overdue_options = white_over.head(20)["number"].astype(int).tolist()
-    number_selected = st.selectbox("Pick from most overdue", options=overdue_options, index=0, key="rolling_overdue_pick")
-
-roll_df = rolling_hits_white(filtered, int(number_selected), window=int(rolling_window))
-fig = px.line(
-    roll_df,
-    x="draw_date",
-    y="rolling_hits",
-    title=f"White ball {int(number_selected)}: rolling hits over last {int(rolling_window)} draws",
-)
-fig.update_layout(height=340)
-st.plotly_chart(fig, width="stretch")
-
-st.subheader("Raw data")
-st.dataframe(
-    filtered[["draw_date", *WHITE_COLS, "powerball", "power_play", "weekday", "era", "year"]],
-    width="stretch",
-    hide_index=True,
-)
-
-csv_export = filtered[["draw_date", *WHITE_COLS, "powerball", "power_play", "weekday", "era", "year"]].to_csv(index=False).encode("utf-8")
-st.download_button("Download filtered dataset", csv_export, file_name="powerball_filtered.csv", mime="text/csv")
-
-if OPENPYXL_OK:
-    excel_bytes = build_excel_export(
-        filtered=filtered,
-        white_exp=white_exp,
-        pb_exp=pb_exp,
-        white_over=white_over,
-        pb_over=pb_over,
-        white_score=white_score,
-        bucket_stats=bucket_stats,
-        digit_stats=digit_stats,
-        stability=stability_df,
-        quality_summary=quality_summary,
-        quality_issues=quality_issues,
-        white_forecast=white_forecast,
-        pb_forecast=pb_forecast,
-        tickets_forecast=tickets_forecast,
-        sim_white_number_freq=sim_white_number_freq,
-        sim_powerball_freq=sim_powerball_freq,
-        sim_pair_freq=sim_pair_freq,
-        sim_triplet_freq=sim_triplet_freq,
-        sim_df=sim_df.sort_values("number").reset_index(drop=True),
-    )
-    st.download_button(
-        "Download full analysis (Excel)",
-        excel_bytes,
-        file_name="powerball_analysis.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-else:
-    st.info("Install `openpyxl` to enable Excel export.")

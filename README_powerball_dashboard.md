@@ -4,6 +4,8 @@ This Streamlit dashboard loads a historical Powerball CSV and normalizes mixed h
 
 ## Files
 - `powerball_dashboard_app.py` — main Streamlit app
+- `powerball_core.py` — pure forecast and walk-forward validation logic
+- `test_powerball_core.py` — unit tests for the forecast core
 - `powerball.csv` — sample historical file
 - `POWERBALL_ANALYTICAL_STUDY.md` — formulas, methodology, and findings for the uploaded file
 - `requirements_powerball_dashboard.txt` — Python dependencies
@@ -12,7 +14,7 @@ This Streamlit dashboard loads a historical Powerball CSV and normalizes mixed h
 This historical file is **not a single regime**. It mixes at least these eras:
 - `2010-2011 | 5/59 + PB39`
 - `2012-2015 | 5/59 + PB35`
-- `2015-2026 | 5/69 + PB26`
+- `2015-present | 5/69 + PB26`
 
 Because of that, a fixed expected value such as `5T/69` for all white balls or `T/26` for all Powerballs is mathematically wrong over the full dataset.
 
@@ -25,20 +27,11 @@ where:
 - `P_t` = Powerball pool size in draw `t`
 
 ## Features
-- Sidebar navigation by independent sections (click-to-navigate):
-  - `Inicio (Forecast)`
-  - `Perfil y Calidad`
-  - `Frecuencia y Significancia`
-  - `Diagnosticos`
-  - `Recencia (Overdue)`
-  - `Estructura y Combinaciones`
-  - `Simulador Fisico`
-  - `Rolling`
-  - `Datos y Exportes`
+- Numbered sidebar navigation with independent sections, including a dedicated historical-validation page.
 - Upload CSV directly in the app
-- Manual official data sync from Texas Lottery CSV:
+- Automatic official data sync from Texas Lottery CSV with a six-hour cache and manual refresh:
   - Source: `https://www.texaslottery.com/export/sites/lottery/Games/Powerball/Winning_Numbers/powerball.csv`
-  - Sync button enabled only on draw days (Mon/Wed/Sat, Texas time)
+  - Bundled local CSV is used as a fallback if the official source is unavailable
 - Auto-parse rows with and without `Power Play`
 - Filter by era, year, weekday, and date range
 - Observed vs expected counts
@@ -60,7 +53,7 @@ where:
   - Duplicate white numbers in a draw
   - Out-of-range white numbers by era
   - Out-of-range Powerball by era
-- Composite exploration score with tunable weights
+- Composite exploration score with tunable weights for descriptive views only
 - Physical Bias Simulator (experimental):
   - Uniform mode
   - Weight bias mode
@@ -69,7 +62,11 @@ where:
 - Forecast section now includes:
   - Filterable views (`Mas probables`, `Menos probables`, `Mas atrasadas`, `Mas frias`)
   - White number range filter
-  - Forecast formula based on winning-number history only, with active-era weighting and smoothing
+  - Forecast trained independently from visualization filters
+  - Current-matrix-only training with Bayesian smoothing
+  - No overdue/gap signal in the default forecast
+  - Model strength calibrated on early history and evaluated on a later holdout
+  - White inclusion rates estimated from the same without-replacement ticket simulation
   - Data-clear block with winning/losing combinations:
     - Top exact tickets (5+PB)
     - One-hit losing tickets
@@ -82,6 +79,9 @@ where:
   - Most overdue
 - CSV export of filtered data
 - Excel export with multi-sheet analytical outputs
+- Walk-forward backtest with Brier score, log-loss, top-k hits, yearly stability, and uniform baseline
+- Era-aware expected values for historical pairs and triplets
+- Unit tests for the pure forecast core in `powerball_core.py`
 
 ## Install
 ```bash
@@ -91,6 +91,11 @@ pip install -r requirements_powerball_dashboard.txt
 ## Run
 ```bash
 streamlit run powerball_dashboard_app.py
+```
+
+## Test
+```bash
+python3 -m unittest -v test_powerball_core.py
 ```
 
 ## GitHub + Live (Streamlit Community Cloud)

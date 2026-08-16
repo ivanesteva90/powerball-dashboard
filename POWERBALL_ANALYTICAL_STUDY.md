@@ -1,4 +1,7 @@
-# Powerball Analytical Study for Uploaded Historical CSV
+# Powerball Analytical Study — Archived Snapshot
+
+> This document preserves the March 2026 study and is not refreshed automatically. The live dashboard and its
+> `Validación histórica` page are the current source for data range, forecast calibration, and backtest results.
 
 ## 1. Data profile
 Parsed historical draws: **1,921**
